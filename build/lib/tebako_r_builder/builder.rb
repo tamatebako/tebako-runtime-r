@@ -78,7 +78,8 @@ module TebakoRBuilder
       build = TebakoRBuilder::RBuild.new(platform: @platform, r_version: @r_version,
                                          prefix: @prefix, tarball: tarball, src_sha256: sha256,
                                          link_unit: link_unit, link_unit_dir: link_unit_dir,
-                                         repo_root: @repo_root, jobs: @jobs)
+                                         repo_root: @repo_root, jobs: @jobs,
+                                         macos_deployment_target: @contract.macos_deployment_target)
                                     .run
       finalize(build.exe_path)
       assemble_and_pack_image(build, sha256, link_unit, link_unit_dir, tfs)

@@ -34,7 +34,12 @@ module TebakoRBuilder
   class RVersion
     # The one owner of the line grammar (spec 00 §10): the schema's
     # catalog pattern mirrors it (asserted by the lint gate passing on
-    # the same strings).
+    # the same strings), and the tebako-release gem's package-filename
+    # parse interpolates LINE_GRAMMAR_SOURCE through this factory's
+    # adapter (scripts/release_adapter.rb) — nothing re-derives it.
+    # LINE_GRAMMAR_SOURCE stays anchor-free: the gem wraps it in its own
+    # \A…\z package-name pattern (uploader.rb's parse_package_filename).
+    LINE_GRAMMAR_SOURCE = '\d+\.\d+\.\d+'
     LINE_PATTERN = /\A(?<base>\d+\.\d+\.\d+)\z/.freeze
 
     def initialize(r_version)

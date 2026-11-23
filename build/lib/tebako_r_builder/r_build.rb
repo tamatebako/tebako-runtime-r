@@ -80,14 +80,22 @@ module TebakoRBuilder
   # half-applied edit.
   #
   # Before configure, the deps stage builds the libraries the shipped
-  # closure needs but no honest artifact can take from the distro
-  # (build_deps): the -fPIC static zlib (R links -lz into internet.so,
-  # a shared object, and the focal toolchain's libz.a carries no PIC —
-  # build_zlib's comment); the static OpenSSL 3 (LTS, Apache-2.0) that
-  # curl 8.23 requires (the focal toolchain carries only the EOL 1.1.1);
-  # and the minimal static libcurl that R 4.6 hard-requires — R_LIBCURL
-  # has no opt-out, and the distro libcurl's LGPL/GPL-encumbered closure
-  # is exactly what must not ship. See the build_* comments.
+  # closure needs but no honest artifact can take from the toolchain or
+  # OS (build_deps): on the linux legs, the -fPIC static zlib (R links
+  # -lz into internet.so, a shared object, and the focal toolchain's
+  # libz.a carries no PIC — build_zlib's comment); the static OpenSSL 3
+  # (LTS, Apache-2.0) that curl 8.23 requires (the focal toolchain
+  # carries only the EOL 1.1.1, and a bare musl target carries no
+  # libssl at all); and the minimal static libcurl that R 4.6
+  # hard-requires — R_LIBCURL has no opt-out, and the distro libcurl's
+  # LGPL/GPL-encumbered closure is exactly what must not ship. On the
+  # macOS legs the tier is pcre2 + xz instead: R 4.6 dropped its bundled
+  # copies, and the macOS SDK ships the .tbd stubs WITHOUT the
+  # pcre2.h/lzma.h headers, so the system dylibs are unprobe-able and a
+  # Homebrew find is tebako-runtime-python#80's leak class — while
+  # libz/libbz2/libcurl are macOS's own (SDK stub + header + the dyld
+  # cache on every bare macOS) and link dynamically by design. See the
+  # build_* comments.
   #
   # The shipped exe is the build tree's src/main/R.bin — NOT Rscript:
   # upstream's Rscript is a launcher that execv()s R_HOME/bin/R, a SHELL
@@ -118,23 +126,32 @@ module TebakoRBuilder
     # audience rule; the parallel increment revisits with a static
     # libgomp), --disable-R-shlib (R.bin links libR STATICALLY — the exe
     # must start standalone to boot the driver, before any shim exists
-    # to serve libR.so), R's own included BLAS at the configure defaults
-    # (no --with-blas, no --enable-BLAS-shlib: upstream builds the
-    # included BLAS ONLY as the shared libRblas.so, so R.bin cannot
-    # consume it through BLAS_LIBS — an exe that NEEDs libRblas.so could
-    # never boot the driver, because ld.so resolves NEEDED before
+    # to serve libR.so), --without-blas (R's own included BLAS — the
+    # linux defaults already deliver it since no system BLAS exists in
+    # the containers, but on darwin the external-BLAS search would find
+    # Apple's Accelerate and fork the BLAS story per platform; the pin
+    # keeps ONE story everywhere: upstream builds the included BLAS ONLY
+    # as the shared libRblas (.so/.dylib), so R.bin cannot
+    # consume it through BLAS_LIBS — an exe that NEEDs libRblas could
+    # never boot the driver, because the loader resolves NEEDED before
     # main(), before any mount exists. Substitution 4 instead links the
-    # BLAS objects themselves into R.bin — the same objects libRblas.so
+    # BLAS objects themselves into R.bin — the same objects libRblas
     # carries, built before src/main in R's own SUBDIRS order — and
-    # libRblas.so still builds and ships in lib/R/lib for libRlapack.so,
+    # libRblas still builds and ships in lib/R/lib for libRlapack,
     # resolved post-mount through the dylib rpath), --without-lapack
-    # (R's included LAPACK, built as libRlapack.so and resolved
+    # (R's included LAPACK, built as libRlapack and resolved
     # post-mount through the dylib rpath — LAPACK is only ever reached
     # through the dlopen'd lapack module, never at R.bin's exec),
     # --without-libdeflate-compression (deterministic:
     # otherwise a build host with libdeflate-dev produces a different
     # artifact than one without — the python#80 shape; zlib serves
-    # lazy-load compression), --with-recommended-packages=no (the
+    # lazy-load compression), --disable-nls (the translation catalogs
+    # are the interactive surface, outside the wedge; and on musl the
+    # NLS probe links gettext's libintl.so.8 INTO R.bin — glibc folds
+    # gettext into libc so the gnu leg never leaks it, but a bare musl
+    # target cannot satisfy libintl (the audience rule), so NLS is off
+    # uniformly, one feature set on every leg),
+    # --with-recommended-packages=no (the
     # MASS-class set is payload-closure territory, staged at press time
     # like pydata — README's limits section).
     CONFIGURE_ARGS = %w[
@@ -148,13 +165,15 @@ module TebakoRBuilder
       --with-libtiff=no
       --disable-openmp
       --disable-R-shlib
+      --disable-nls
+      --without-blas
       --without-lapack
       --without-libdeflate-compression
       --with-recommended-packages=no
     ].freeze
 
     def initialize(platform:, r_version:, prefix:, tarball:, src_sha256:, # rubocop:disable Metrics/ParameterLists,Metrics/MethodLength
-                   link_unit:, link_unit_dir:, repo_root:, jobs: nil)
+                   link_unit:, link_unit_dir:, repo_root:, jobs: nil, macos_deployment_target: nil)
       @platform = platform
       @r_version = r_version
       @r = TebakoRBuilder::RVersion.new(r_version)
@@ -165,19 +184,23 @@ module TebakoRBuilder
       @link_unit_dir = link_unit_dir
       @repo_root = repo_root
       @jobs = jobs
+      @macos_deployment_target = macos_deployment_target
       @dep_sources = []
     end
 
     attr_reader :src_dir, :stage_dir
 
     def run
-      extract
-      build_deps
-      configure
-      substitute_makefile
-      write_fs_tu
-      make
-      install
+      TebakoRBuilder::BuildHelpers.with_env(floor_env) do
+        extract
+        build_deps
+        configure
+        substitute_makefile
+        write_fs_tu
+        make
+        install
+        fixup_darwin_install_names
+      end
       self
     end
 
@@ -281,18 +304,27 @@ module TebakoRBuilder
     end
 
     # The deps stage (the class comment): the factory-built libraries
-    # the shipped closure needs but no honest artifact can consume the
-    # distro's — zlib first (curl's own --static-libs names -lz), then
-    # OpenSSL (curl links against it), then libcurl (their comments
-    # carry the why). Runs before configure so
-    # configure_env's CURL_CONFIG names a real file; the
+    # the shipped closure needs but no honest artifact can consume from
+    # the toolchain or OS. The linux legs build zlib first (curl's own
+    # --static-libs names -lz), then OpenSSL (curl links against it),
+    # then libcurl (their comments carry the why); pcre2/xz ride the
+    # toolchain's -dev packages there (apt on gnu, apk on musl — the
+    # in-leg provisioning). The macOS legs build pcre2 + xz instead (the
+    # SDK ships the stubs without the headers — build_pcre2's comment)
+    # and link libz/libbz2/libcurl against macOS's own dylibs (the
+    # audience rule allows the platform's own libraries; the provenance
+    # gate's Mach-O arm proves the closure stays system-only). Runs
+    # before configure so configure_env's pins name real files; the
     # unsupported-leg gate lives in configure.
     def build_deps
-      return unless @platform.linux_gnu?
-
-      build_zlib
-      build_openssl
-      build_curl
+      if @platform.linux?
+        build_zlib
+        build_openssl
+        build_curl
+      elsif @platform.macos?
+        build_pcre2
+        build_xz
+      end
     end
 
     def deps_prefix
@@ -362,18 +394,21 @@ module TebakoRBuilder
     # Apache-2.0: license-clean for static linking, unlike the LGPL TLS
     # stacks). curl 8.23 requires OpenSSL >= 3.0 and the focal toolchain
     # image carries only the EOL 1.1.1, so the distro has nothing honest
-    # to offer — the factory builds its own. no-shared (static archives
+    # to offer (the musl image is newer, but a bare musl target carries
+    # no libssl at all — the audience rule answers both legs the same
+    # way) — the factory builds its own. no-shared (static archives
     # only), no-module + no-dso (the providers are built INTO libcrypto
     # — a module build would dlopen them at runtime from the BUILD
     # machine's <prefix>/lib/ossl-modules, a path that exists nowhere
     # on the user's system or inside the VFS), no-tests (build time).
     # -fPIC: libssl.a/libcrypto.a link into internet.so, a shared
-    # object. --openssldir names the DEBIAN layout baked at runtime
-    # (X509 default cert file/dir resolve to /etc/ssl/certs through
-    # /usr/lib/ssl, exactly as the distro's own OpenSSL behaves;
-    # SSL_CERT_FILE/SSL_CERT_DIR override at run time) — install_sw
-    # touches only the container's own filesystem there, never the
-    # bind mount.
+    # object. --openssldir names the layout baked at runtime
+    # (X509 default cert file/dir resolve there; SSL_CERT_FILE/
+    # SSL_CERT_DIR override at run time) — the debian layout on the gnu
+    # leg (/usr/lib/ssl → /etc/ssl/certs, exactly as the distro's own
+    # OpenSSL behaves), the alpine layout on the musl leg (/etc/ssl).
+    # install_sw touches only the container's own filesystem there,
+    # never the bind mount.
     def build_openssl
       fetcher = TebakoRBuilder::SourceFetcher.new(cache_dir: File.join(@prefix, "downloads"))
       (tarball, sha256) = fetcher.fetch_dep("openssl")
@@ -397,8 +432,8 @@ module TebakoRBuilder
 
       begin
         TebakoRBuilder::BuildHelpers.run_with_capture(
-          ["perl", "Configure", "linux-x86_64",
-           "--prefix=#{deps_prefix}", "--libdir=lib", "--openssldir=/usr/lib/ssl",
+          ["perl", "Configure", openssl_configure_target,
+           "--prefix=#{deps_prefix}", "--libdir=lib", "--openssldir=#{openssl_ca_dir}",
            "no-shared", "no-module", "no-dso", "no-tests", "-fPIC"],
           chdir: openssl_src
         )
@@ -414,6 +449,18 @@ module TebakoRBuilder
 
       File.write(marker, "#{sha256}\n")
       puts "   ... #{File.join(deps_prefix, "lib", "libssl.a")} installed"
+    end
+
+    # OpenSSL's Configure target for the leg's arch (the linux legs —
+    # darwin builds no OpenSSL).
+    def openssl_configure_target
+      @platform.host_id.end_with?("arm64") ? "linux-aarch64" : "linux-x86_64"
+    end
+
+    # The CA layout baked into the static OpenSSL (build_openssl's
+    # comment): debian's on the gnu leg, alpine's on the musl leg.
+    def openssl_ca_dir
+      @platform.musl? ? "/etc/ssl" : "/usr/lib/ssl"
     end
 
     # The minimal static libcurl's configure line (build_curl's
@@ -515,15 +562,116 @@ module TebakoRBuilder
       puts "   ... #{curl_config} --static-libs: #{`#{curl_config} --static-libs`.strip}"
     end
 
+    # The static PCRE2 (versions.yml's deps: pin; the macOS legs only —
+    # build_deps' comment). R 4.6 dropped its bundled pcre2 and
+    # hard-requires an external one, and the macOS SDK ships libpcre2-8's
+    # .tbd stub WITHOUT pcre2.h, so the system dylib is unprobe-able and
+    # a Homebrew find is tebako-runtime-python#80's leak class — the
+    # factory builds its own. --disable-shared: archives only, -fPIC
+    # throughout (pcre2 only ever reaches libR — the exe link — but PIC
+    # keeps a later shared-object consumer honest). The install's
+    # lib/pkgconfig/libpcre2-8.pc is what configure's R_PCRE2 finds
+    # through configure_env's PKG_CONFIG_PATH pin — never the runner's
+    # Homebrew pkg-config.
+    def build_pcre2
+      fetcher = TebakoRBuilder::SourceFetcher.new(cache_dir: File.join(@prefix, "downloads"))
+      (tarball, sha256) = fetcher.fetch_dep("pcre2")
+      tree = File.basename(tarball).sub(/\.tar\.gz\z/, "")
+      @dep_sources << { "name" => File.basename(tarball), "sha256" => sha256 }
+      marker = File.join(deps_prefix, ".#{tree}.built-sha256")
+      if File.file?(File.join(deps_prefix, "lib", "libpcre2-8.a")) &&
+         File.file?(marker) && File.read(marker).strip == sha256
+        puts "-- #{tree} already built (sha256 #{sha256})"
+        return
+      end
+
+      puts "-- Building #{tree} (static, -fPIC, sha256 #{sha256})"
+      pcre2_src = File.join(deps_src_dir, tree)
+      FileUtils.rm_rf(pcre2_src, secure: true)
+      FileUtils.mkdir_p(deps_src_dir)
+      TebakoRBuilder::BuildHelpers.run_with_capture(["tar", "-xzf", tarball, "-C", deps_src_dir])
+      unless File.directory?(pcre2_src)
+        raise TebakoRBuilder::Error.new("#{tarball} did not extract to #{tree} under #{deps_src_dir}", 103)
+      end
+
+      begin
+        TebakoRBuilder::BuildHelpers.run_with_capture(
+          ["./configure", "--prefix=#{deps_prefix}",
+           "--disable-shared", "--enable-static",
+           # R consumes the 8-bit library only (PCRE2_CODE_UNIT_WIDTH=8,
+           # m4/R.m4's R_PCRE2).
+           "--disable-pcre2-16", "--disable-pcre2-32"],
+          env: { "CFLAGS" => "-O2 -fPIC" }, chdir: pcre2_src
+        )
+      rescue TebakoRBuilder::Error => e
+        raise TebakoRBuilder::Error.new("'build_runtime' deps stage (pcre2 configure) failed: #{e.message}", 103)
+      end
+      begin
+        TebakoRBuilder::BuildHelpers.run_with_capture(["make", "-j", ncores.to_s], chdir: pcre2_src)
+        TebakoRBuilder::BuildHelpers.run_with_capture(["make", "install"], chdir: pcre2_src)
+      rescue TebakoRBuilder::Error => e
+        raise TebakoRBuilder::Error.new("'build_runtime' deps stage (pcre2 build) failed: #{e.message}", 104)
+      end
+
+      File.write(marker, "#{sha256}\n")
+      puts "   ... #{File.join(deps_prefix, "lib", "libpcre2-8.a")} installed"
+    end
+
+    # The static liblzma (versions.yml's deps: pin; the macOS legs only —
+    # build_deps' comment): R 4.6 dropped its bundled xz and the macOS
+    # SDK ships liblzma's .tbd without lzma.h (build_pcre2's comment).
+    # Only liblzma is needed — the xz tools and scripts stay off.
+    def build_xz
+      fetcher = TebakoRBuilder::SourceFetcher.new(cache_dir: File.join(@prefix, "downloads"))
+      (tarball, sha256) = fetcher.fetch_dep("xz")
+      tree = File.basename(tarball).sub(/\.tar\.gz\z/, "")
+      @dep_sources << { "name" => File.basename(tarball), "sha256" => sha256 }
+      marker = File.join(deps_prefix, ".#{tree}.built-sha256")
+      if File.file?(File.join(deps_prefix, "lib", "liblzma.a")) &&
+         File.file?(marker) && File.read(marker).strip == sha256
+        puts "-- #{tree} already built (sha256 #{sha256})"
+        return
+      end
+
+      puts "-- Building #{tree} (static liblzma only, -fPIC, sha256 #{sha256})"
+      xz_src = File.join(deps_src_dir, tree)
+      FileUtils.rm_rf(xz_src, secure: true)
+      FileUtils.mkdir_p(deps_src_dir)
+      TebakoRBuilder::BuildHelpers.run_with_capture(["tar", "-xzf", tarball, "-C", deps_src_dir])
+      unless File.directory?(xz_src)
+        raise TebakoRBuilder::Error.new("#{tarball} did not extract to #{tree} under #{deps_src_dir}", 103)
+      end
+
+      begin
+        TebakoRBuilder::BuildHelpers.run_with_capture(
+          ["./configure", "--prefix=#{deps_prefix}",
+           "--disable-shared", "--enable-static",
+           "--disable-xz", "--disable-xzdec", "--disable-lzmadec", "--disable-scripts"],
+          env: { "CFLAGS" => "-O2 -fPIC" }, chdir: xz_src
+        )
+      rescue TebakoRBuilder::Error => e
+        raise TebakoRBuilder::Error.new("'build_runtime' deps stage (xz configure) failed: #{e.message}", 103)
+      end
+      begin
+        TebakoRBuilder::BuildHelpers.run_with_capture(["make", "-j", ncores.to_s], chdir: xz_src)
+        TebakoRBuilder::BuildHelpers.run_with_capture(["make", "install"], chdir: xz_src)
+      rescue TebakoRBuilder::Error => e
+        raise TebakoRBuilder::Error.new("'build_runtime' deps stage (xz build) failed: #{e.message}", 104)
+      end
+
+      File.write(marker, "#{sha256}\n")
+      puts "   ... #{File.join(deps_prefix, "lib", "liblzma.a")} installed"
+    end
+
     # The relocatable configure: the compiled-in prefix IS the mount root
     # (rhome = <prefix>/<LIBnn>/R = <mount root>/lib/R — the path Rscript's
     # launcher and our fs TU's R_HOME both spell). The feature policy is
     # CONFIGURE_ARGS (the class comment).
     def configure
-      unless @platform.linux_gnu?
+      if @platform.msys?
         raise TebakoRBuilder::Error.new(
-          "the skeleton ships the linux-gnu leg only — musl/macos/windows arrive with " \
-          "their legs (the fs TU is POSIX-only today)", 103
+          "the windows legs arrive with their own increment — " \
+          "this factory builds POSIX legs only today (the fs TU is POSIX-only)", 103
         )
       end
 
@@ -534,12 +682,25 @@ module TebakoRBuilder
       puts "   ... compile flags (Makeconf CFLAGS): #{recorded_cflags}"
     rescue TebakoRBuilder::Error => e
       raise e if e.error_code == 103 &&
-                 (e.message.include?("skeleton ships") || e.message.include?("Makeconf") || e.message.include?("static"))
+                 (e.message.include?("POSIX legs") || e.message.include?("Makeconf") || e.message.include?("static"))
 
       raise TebakoRBuilder::Error.new("'build_runtime' configure step failed: #{e.message}", 103)
     end
 
-    # linux-gnu, the container/env honesty pins:
+    # The configure env, per leg family: the ELF legs share one shape
+    # (elf_configure_env — the gnu/musl differences are the quadmath
+    # absence on musl and the apk-vs-apt provisioning, both noted
+    # there); darwin is its own (darwin_configure_env — clang/ld64
+    # grammar, the system-library closure, and the deps-stage pcre2/xz).
+    def configure_env
+      if @platform.macos?
+        darwin_configure_env
+      else
+        elf_configure_env
+      end
+    end
+
+    # linux-gnu/linux-musl, the container/env honesty pins:
     #
     #   LIBnn=lib — rhome is <prefix>/lib/R (never lib64: ubuntu has no
     #   /usr/lib64, and R's configure would otherwise pick lib64 on
@@ -666,13 +827,23 @@ module TebakoRBuilder
     #   same reason. Lazy-load databases stay gzip/xz/bzip2 (R's own
     #   install default is gzip; zstd-compressed third-party .rdb files
     #   are out of the payload-closure contract).
-    def configure_env
+    #
+    # The musl legs differ in exactly one pin: alpine's aarch64 gfortran
+    # is built WITHOUT libquadmath (`gfortran
+    # -print-file-name=libquadmath.a` finds nothing there —
+    # container-proven), so its libgfortran.a resolves the quad I/O
+    # chain internally and its FLIBS pin drops -lquadmath. x86_64 alpine
+    # ships libquadmath.a and its libgfortran.a references
+    # quadmath_snprintf exactly like gnu's, so the pin keeps -lquadmath
+    # there (quadmath_static?).
+    def elf_configure_env
       static_fortran = "-static-libgfortran -static-libgcc"
+      quadmath = quadmath_static? ? " -lquadmath" : ""
       {
         "LIBnn" => "lib",
         "CFLAGS" => "-O2",
         "LDFLAGS" => "-L#{static_libs_dir} #{static_fortran}",
-        "FLIBS" => "#{static_fortran} -Wl,--undefined=_gfortran_concat_string -lgfortran -lquadmath -lm",
+        "FLIBS" => "#{static_fortran} -Wl,--undefined=_gfortran_concat_string -lgfortran#{quadmath} -lm",
         "FLIBS_IN_SO" => "#{static_fortran} -lm",
         "SHLIB_LDFLAGS" => "#{static_fortran} -Wl,-rpath,'$$ORIGIN/../lib:$$ORIGIN/../../../lib'",
         "CURL_CONFIG" => curl_config,
@@ -680,51 +851,232 @@ module TebakoRBuilder
       }
     end
 
-    # The static archives the -L pin fronts (configure_env's comment).
-    # libz.a is the deps stage's own -fPIC build (build_zlib) — the
-    # toolchain's archive carries no PIC and internet.so links -lz into
-    # a shared object; libbz2/liblzma/libpcre2-8 come from the
-    # toolchain's -dev packages and only ever reach R.bin's link. The
-    # gfortran pair comes from the compiler's own directory: ONLY the
-    # exe's FLIBS pulls them (FLIBS_IN_SO drops -lgfortran entirely),
-    # so their non-PIC members never enter a shared object.
-    STATIC_ARCHIVES = %w[libz.a libbz2.a liblzma.a libpcre2-8.a libgfortran.a libquadmath.a].freeze
+    # darwin, the runner/SDK honesty pins. The shape differs from the
+    # ELF legs because the platform grammar differs:
+    #
+    #   The closure is macOS's own where macOS guarantees it: libz,
+    #   libbz2, and libcurl ship in every macOS install (SDK stub +
+    #   header + the dyld shared cache), so they link DYNAMICALLY — the
+    #   provenance gate's Mach-O arm allows /usr/lib/* and
+    #   /System/Library/* by design, and internet.so records
+    #   /usr/lib/libcurl.4.dylib there exactly as the linux legs record
+    #   nothing. pcre2 and xz are the exceptions (build_deps' comment:
+    #   the SDK ships their .tbd stubs WITHOUT the headers) — they come
+    #   from the deps stage statically, and the -L pin's dir fronts
+    #   their archives so configure's probes resolve them.
+    #
+    #   LIBnn=lib / CFLAGS=-O2 / the zstd cache pin — the same honesty
+    #   pins as the ELF legs (the runner exports no clobbering CFLAGS,
+    #   but an explicit -O2 is deterministic and the recorded_cflags
+    #   gate reads the same Makeconf).
+    #
+    #   CPPFLAGS=-I<deps>/include — pcre2.h and lzma.h live nowhere else
+    #   (the SDK omits them; the deps stage installed them). R's header
+    #   probes resolve here.
+    #
+    #   PKG_CONFIG_PATH=<deps>/lib/pkgconfig — R_PCRE2 (m4/R.m4) probes
+    #   pkg-config FIRST, and a macOS runner's Homebrew pkg-config WOULD
+    #   find Homebrew's libpcre2-8 and leak it into the closure (the
+    #   tebako-runtime-python#80 class). The pin points the probe at the
+    #   deps stage's own libpcre2-8.pc — and at nothing else, which is
+    #   also the determinism pin for every other pkg-config probe R
+    #   runs.
+    #
+    #   LDFLAGS=-L<static-libs> — fronts the static archives for
+    #   -lpcre2-8/-llzma (the deps stage's) and -lgfortran/-lquadmath/
+    #   -lgcc (the compiler's, symlinked) and nothing else: -lz/-lbz2/-lcurl
+    #   fall through to the SDK stubs and link dynamically (the closure
+    #   comment above). NO -static-libgfortran/-static-libgcc: those are
+    #   gcc driver flags and darwin links with clang, which rejects
+    #   them — the static gfortran closure is the -L pin's work alone.
+    #
+    #   FLIBS — clang's spelling of the exe-side gfortran chain (the
+    #   ELF comment's split applies one-for-one, with ld64 grammar):
+    #   -Wl,-u,__gfortran_concat_string forces the member in (darwin
+    #   symbol names carry the leading underscore; the exe's own objects
+    #   reference no gfortran symbol), -lgfortran/-lquadmath resolve
+    #   statically against the -L pin, and -lgcc closes the chain:
+    #   libgfortran.a's quadmath IO references GCC's 128-bit soft-float
+    #   routines (__divtf3/__multf3/__eqtf2…, libgcc.a) which Apple's
+    #   compiler-rt omits on arm64 (darwin long double is 64-bit), so
+    #   the -lgfortran/-lquadmath pair alone leaves them undefined.
+    #   ld64 needs no --export-dynamic:
+    #   the exe's global symbols are visible to dlopen'd bundles by
+    #   default, so libRlapack.dylib's undefined gfortran reference
+    #   binds from the exe exactly as R's own symbols do under
+    #   --disable-R-shlib. The provenance gate asserts the export.
+    #
+    #   FLIBS_IN_SO — drops the gfortran chain entirely (just -lm):
+    #   darwin's shlib AND dylib links both carry -undefined
+    #   dynamic_lookup (configure.ac's darwin branch), so every shared
+    #   object's gfortran references defer to load time and bind from
+    #   the exe — no shared object records a gfortran dylib, and no
+    #   static archive needs PIC-in-dylib treatment (though darwin's are
+    #   PIC anyway).
+    #
+    #   SHLIB_LDFLAGS — the $ORIGIN pin's darwin spelling,
+    #   -Wl,-rpath,@loader_path/../lib plus @loader_path/../../../lib:
+    #   lapack.so records libRlapack.dylib and libRblas.dylib (ld64
+    #   records every linked dylib — there is no --as-needed default to
+    #   defeat, which is why substitution 5 is verify-only on this
+    #   leg), and the exec_closure walk resolves a bare install name
+    #   only through the importing object's own LC_RPATH — the two
+    #   depths cover lib/R/modules and lib/R/library/<pkg>/libs exactly
+    #   as on linux.
+    #
+    #   DYLIB_LDFLAGS — libRlapack.dylib/libRblas.dylib's own rpath:
+    #   from lib/R/lib, libRlapack.dylib's recorded libRblas.dylib
+    #   resolves through @loader_path/. (configure.ac honors the preset
+    #   and appends its -dynamiclib/-headerpad/dynamic_lookup triple;
+    #   an unset DYLIB_LD inherits SHLIB_LD).
+    #
+    #   CURL_CONFIG=/usr/bin/curl-config — macOS's own libcurl (the
+    #   closure comment): the system curl-config answers --built-shared
+    #   "yes", so R consumes --libs (-lcurl, dynamic) — the deps stage
+    #   builds no curl/openssl/zlib on this leg at all.
+    #
+    #   ac_cv_lib_zstd_ZSTD_versionNumber=no — the ELF pin, same reason.
+    def darwin_configure_env
+      {
+        "LIBnn" => "lib",
+        "CFLAGS" => "-O2",
+        "CPPFLAGS" => "-I#{File.join(deps_prefix, "include")}",
+        "PKG_CONFIG_PATH" => File.join(deps_prefix, "lib", "pkgconfig"),
+        "LDFLAGS" => "-L#{static_libs_dir}",
+        "FLIBS" => "-Wl,-u,__gfortran_concat_string -lgfortran -lquadmath -lgcc -lm",
+        "FLIBS_IN_SO" => "-lm",
+        "SHLIB_LDFLAGS" => "-Wl,-rpath,@loader_path/../lib -Wl,-rpath,@loader_path/../../../lib",
+        "DYLIB_LDFLAGS" => "-Wl,-rpath,@loader_path/.",
+        "CURL_CONFIG" => "/usr/bin/curl-config",
+        "ac_cv_lib_zstd_ZSTD_versionNumber" => "no"
+      }
+    end
+
+    # The macOS support floor rides the WHOLE build as
+    # MACOSX_DEPLOYMENT_TARGET — configure's probes compile+link, the
+    # deps stage builds under it, and the exe's final link (inside make)
+    # is what clang stamps as LC_BUILD_VERSION minos. Unpinned, the
+    # stamp floats with the build host's OS (tebako-runtime-python#81:
+    # the Intel runtime refused to load on macOS 14). The pin is
+    # contract.yml's macos_deployment_target, a product decision, and
+    # the provenance gate asserts the recorded minos equals it.
+    # Off-macOS the env is empty and merges as a no-op.
+    def floor_env
+      return {} unless @platform.macos?
+
+      floor = @macos_deployment_target.to_s
+      if floor.empty?
+        raise TebakoRBuilder::Error.new(
+          "no macos_deployment_target pin (contract.yml) — the macOS support floor is a product decision, " \
+          "never the runner image's accident (tebako-runtime-python#81)", 64
+        )
+      end
+      { "MACOSX_DEPLOYMENT_TARGET" => floor }
+    end
+
+    # The static archives the -L pin fronts (configure_env's comments),
+    # per leg. libz.a is the deps stage's own -fPIC build on the linux
+    # legs (build_zlib) — the toolchain's archive carries no PIC and
+    # internet.so links -lz into a shared object; libbz2/liblzma/
+    # libpcre2-8 come from the toolchain's -dev packages there and only
+    # ever reach R.bin's link (on darwin the pcre2/xz pair is the deps
+    # stage's own — the SDK ships no headers — and libz/libbz2 link
+    # dynamically against macOS's own dylibs, so they are absent here).
+    # The gfortran pair comes from the compiler's own directory: ONLY
+    # the exe's FLIBS pulls them (FLIBS_IN_SO drops the chain entirely),
+    # so their members never enter a shared object. darwin adds libgcc.a
+    # (the FLIBS comment: libgfortran's quadmath IO needs GCC's 128-bit
+    # soft-float routines, absent from Apple's compiler-rt). musl/arm64
+    # is the one POSIX leg WITHOUT libquadmath: alpine builds no
+    # quadmath support for aarch64 (`gfortran
+    # -print-file-name=libquadmath.a` finds nothing — container-proven),
+    # so its libgfortran.a resolves the quad I/O chain internally.
+    # musl/x86_64 is the gnu shape instead: alpine ships libquadmath.a
+    # and its libgfortran.a references quadmath_snprintf exactly like
+    # gnu's (the same link failure the FLIBS pin answers).
+    STATIC_ARCHIVES_LINUX_GNU = %w[libz.a libbz2.a liblzma.a libpcre2-8.a libgfortran.a libquadmath.a].freeze
+    STATIC_ARCHIVES_LINUX_MUSL = %w[libz.a libbz2.a liblzma.a libpcre2-8.a libgfortran.a libquadmath.a].freeze
+    STATIC_ARCHIVES_LINUX_MUSL_ARM64 = %w[libz.a libbz2.a liblzma.a libpcre2-8.a libgfortran.a].freeze
+    STATIC_ARCHIVES_DARWIN = %w[libpcre2-8.a liblzma.a libgfortran.a libquadmath.a libgcc.a].freeze
+
+    # musl/arm64 is the one leg whose gfortran is built WITHOUT
+    # libquadmath (the constants comment); every other POSIX leg's
+    # libgfortran.a needs the external archive.
+    def quadmath_static?
+      !(@platform.musl? && @platform.host_id.end_with?("arm64"))
+    end
+
+    def static_archives
+      if @platform.macos?
+        STATIC_ARCHIVES_DARWIN
+      elsif @platform.musl?
+        quadmath_static? ? STATIC_ARCHIVES_LINUX_MUSL : STATIC_ARCHIVES_LINUX_MUSL_ARM64
+      else
+        STATIC_ARCHIVES_LINUX_GNU
+      end
+    end
 
     def static_libs_dir
       File.join(@prefix, "static-libs")
     end
 
     # Populate the -L dir with symlinks to the STATIC archives (and only
-    # those). libz.a links the deps stage's build directly; the rest are
-    # located through the compiler's own search path
-    # (`gcc -print-file-name`), never a hardcoded libdir. A missing
-    # archive is a named error with its provisioning hint — the in-leg
-    # apt line installs the -dev packages (contract.yml's container note,
-    # docs/build-chain.md's follow-up).
+    # those). The deps stage's own builds link directly; the toolchain's
+    # archives are located through the compilers' own search paths
+    # (`gcc -print-file-name`; the gfortran pair — and darwin's libgcc.a —
+    # through `gfortran -print-file-name` — clang has no Fortran and no
+    # GCC search path), never a hardcoded libdir. A missing archive is a
+    # named error with its provisioning
+    # hint (docs/build-chain.md's in-leg provisioning note).
     def prepare_static_libs_dir
       FileUtils.mkdir_p(static_libs_dir)
-      STATIC_ARCHIVES.each do |archive|
-        found = archive == "libz.a" ? deps_libz : `gcc -print-file-name=#{archive}`.strip
+      static_archives.each do |archive|
+        found = locate_static_archive(archive)
         unless found.start_with?("/") && File.file?(found)
-          raise TebakoRBuilder::Error.new("no static #{archive} on the toolchain's search path — #{static_archive_hint(archive)}", 103)
+          raise TebakoRBuilder::Error.new("no static #{archive} on the search path — #{static_archive_hint(archive)}", 103)
         end
         FileUtils.ln_sf(File.realpath(found), File.join(static_libs_dir, archive))
       end
-      puts "   ... static closure dir: #{static_libs_dir} (#{STATIC_ARCHIVES.join(' ')})"
+      puts "   ... static closure dir: #{static_libs_dir} (#{static_archives.join(' ')})"
     end
 
-    # The provisioning hint for a missing static archive (prepare_static_libs_dir):
-    # libz.a is the deps stage's own build, the gfortran pair ships with
+    def locate_static_archive(archive)
+      case archive
+      when "libz.a"
+        deps_libz
+      when "libpcre2-8.a", "liblzma.a"
+        @platform.macos? ? File.join(deps_prefix, "lib", archive) : `gcc -print-file-name=#{archive}`.strip
+      when "libgfortran.a", "libquadmath.a", "libgcc.a"
+        # The compiler's own archives (the gfortran pair on every POSIX
+        # leg, libgcc.a on darwin): gfortran locates them — clang has no
+        # Fortran and no GCC search path (darwin's gcc IS clang).
+        `gfortran -print-file-name=#{archive}`.strip
+      else
+        `gcc -print-file-name=#{archive}`.strip
+      end
+    end
+
+    # The provisioning hint for a missing static archive
+    # (prepare_static_libs_dir), per leg: the deps stage builds libz.a on
+    # linux and the pcre2/xz pair on darwin, the gfortran pair ships with
     # the Fortran compiler, and the rest ride the toolchain's -dev
-    # packages.
+    # packages on linux.
     def static_archive_hint(archive)
       case archive
       when "libz.a"
         "the deps stage builds it (build_zlib — run build_runtime from a clean deps prefix)"
-      when "libgfortran.a", "libquadmath.a"
-        "install the Fortran compiler (apt: gfortran — the in-leg provisioning note in docs/build-chain.md)"
+      when "libpcre2-8.a", "liblzma.a"
+        if @platform.macos?
+          "the deps stage builds it (run build_runtime from a clean deps prefix)"
+        else
+          "install the -dev package (apt: liblzma-dev libpcre2-dev · apk: xz-dev xz-static pcre2-dev — " \
+            "the in-leg provisioning note in docs/build-chain.md)"
+        end
+      when "libgfortran.a", "libquadmath.a", "libgcc.a"
+        "install the Fortran compiler (apt/apk: gfortran · macOS: the runner image's Homebrew gcc — " \
+          "the in-leg provisioning note in docs/build-chain.md)"
       else
-        "install the -dev package (apt: libbz2-dev liblzma-dev libpcre2-dev — " \
+        "install the -dev package (apt: libbz2-dev · apk: bzip2-dev bzip2-static — " \
           "the in-leg provisioning note in docs/build-chain.md)"
       end
     end
@@ -791,7 +1143,7 @@ module TebakoRBuilder
     end
 
     # Substitution 5, on the generated src/modules/lapack/Makefile: record
-    # libRblas.so as a DIRECT NEEDED of lapack.so. The tpkg-builder
+    # libRblas as a DIRECT dependency of lapack.so. The tpkg-builder
     # toolchain's link spec enables --as-needed by default
     # (%{!fsanitize=*:--as-needed}), and lapack.so's own objects reference
     # no BLAS symbol, so upstream's -lRblas on the module link (EXTRA_LIBS)
@@ -807,6 +1159,12 @@ module TebakoRBuilder
     # stable prerequisites (Makefile.in + config.status + SOURCES), so no
     # collapse is needed here; the marker re-application guard works the
     # same way as the main Makefile's.
+    #
+    # darwin needs no edit: ld64 records every linked dylib by default
+    # (there is no --as-needed to defeat, and clang rejects the flag), so
+    # lapack.so's -lRblas is a direct LC_LOAD_DYLIB row by construction
+    # — the anchor is verified (a grammar drift is the same named error
+    # here) and nothing is written.
     def substitute_lapack_makefile
       makefile = File.join(src_dir, "src", "modules", "lapack", "Makefile")
       content = File.read(makefile)
@@ -816,6 +1174,17 @@ module TebakoRBuilder
       end
 
       anchor = %r{^(EXTRA_LIBS = -L"\$\(R_HOME\)/lib\$\(R_ARCH\)" -lRlapack )(-L"\$\(R_HOME\)/lib\$\(R_ARCH\)" -lRblas)( \$\(FLIBS_IN_SO\))$}
+      if @platform.macos?
+        unless content.match?(anchor)
+          raise TebakoRBuilder::Error.new(
+            "the lapack module Makefile's EXTRA_LIBS anchor did not match — this R's build grammar " \
+            "drifted from the factory's anchors (substitution 5)", 103
+          )
+        end
+        puts "   ... lapack Makefile: -lRblas is direct on darwin by construction (ld64 records every linked dylib)"
+        return
+      end
+
       substituted = content.gsub(anchor, '\1-Wl,--no-as-needed \2 -Wl,--as-needed\3')
       if substituted == content
         raise TebakoRBuilder::Error.new(
@@ -908,6 +1277,74 @@ module TebakoRBuilder
       TebakoRBuilder::BuildHelpers.run_with_capture(["make", "install", "DESTDIR=#{stage_dir}"], chdir: src_dir)
     rescue TebakoRBuilder::Error => e
       raise TebakoRBuilder::Error.new("'build_runtime' install step failed: #{e.message}", 105)
+    end
+
+    # darwin only: rewrite R's intra-image dylib names to @rpath
+    # spellings. dyld consults LC_RPATH ONLY for runpath-dependent
+    # libraries — dependent names spelled @rpath/<name>; a BARE name
+    # (R's hardcoded `-install_name libRlapack.dylib` grammar) searches
+    # only the cwd and the dyld fallback dirs, never the LC_RPATH
+    # entries, so the SHLIB/DYLIB LDFLAGS rpath pins are dead letters
+    # against upstream's bare names and every stats.so/lapack.so dlopen
+    # dies on libRlapack.dylib (the boot smoke's darwin evidence).
+    # Upstream links every one of these targets with
+    # -headerpad_max_install_names precisely so its packaging can
+    # rewrite install names (src/library/tools/R/install.R's
+    # install_name_tool pass is the same idiom, to absolute framework
+    # paths); this pass is the runtime-image edition, to @rpath paths
+    # the rpath pins resolve root-agnostically (and the exec_closure
+    # walk's @rpath arm materializes — spec 22). ld64 records a
+    # dependency by the linked dylib's ID, so the rewrite touches three
+    # row kinds: the two dylibs' LC_ID_DYLIB, libRlapack's reference to
+    # libRblas, and every .so's references to either (lapack.so, the
+    # library package .so's). Runs on the STAGED tree (a fresh copy per
+    # install — idempotent); the provenance gate's arm 6/7 re-proves
+    # the rewrite and the boot smoke proves the dlopen end to end.
+    DARWIN_RPATH_DYLIBS = %w[libRblas.dylib libRlapack.dylib].freeze
+
+    def fixup_darwin_install_names
+      return unless @platform.macos?
+
+      lib_r = File.join(staged_prefix_tree, "lib", "R")
+      DARWIN_RPATH_DYLIBS.each do |lib|
+        next if File.file?(File.join(lib_r, "lib", lib))
+
+        raise TebakoRBuilder::Error.new(
+          "no #{lib} under #{lib_r}/lib — this R's install grammar drifted (the @rpath fixup " \
+          "expects the included BLAS/LAPACK dylibs at lib/R/lib)", 103
+        )
+      end
+
+      rewritten = DARWIN_RPATH_DYLIBS.count do |lib|
+        darwin_fixup_object(File.join(lib_r, "lib", lib), id: "@rpath/#{lib}")
+      end
+      rewritten += Dir.glob(File.join(lib_r, "**", "*.so")).sort.count do |so|
+        darwin_fixup_object(so)
+      end
+      puts "   ... darwin install names: @rpath rewrite over #{rewritten} object(s) " \
+           "(#{DARWIN_RPATH_DYLIBS.join(' + ')} — dyld consults LC_RPATH only for @rpath-spelled names)"
+    end
+
+    # One object's rows: -id when given (the dylib's own LC_ID_DYLIB),
+    # plus -change for each DARWIN_RPATH_DYLIBS member the object
+    # references by its bare name. Returns true when the object was
+    # rewritten. install_name_tool re-signs ad-hoc on rewrite, so the
+    # arm64 link signatures stay valid for dlopen.
+    def darwin_fixup_object(path, id: nil)
+      out = TebakoRBuilder::BuildHelpers.run_with_capture(["otool", "-L", path])
+      rows = out.lines.drop(1).filter_map { |line| line.strip.split.first }
+      args = []
+      args += ["-id", id] if id
+      DARWIN_RPATH_DYLIBS.each do |lib|
+        next if id == "@rpath/#{lib}" # the -id rewrites the object's own row; -change is for dependents
+        args += ["-change", lib, "@rpath/#{lib}"] if rows.include?(lib)
+      end
+      return false if args.empty?
+
+      TebakoRBuilder::BuildHelpers.run_with_capture(["install_name_tool", *args, path])
+      true
+    rescue TebakoRBuilder::Error => e
+      raise TebakoRBuilder::Error.new("'build_runtime' darwin install-name fixup failed for #{path}: #{e.message}", 103)
     end
 
     public

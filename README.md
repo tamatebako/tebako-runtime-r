@@ -5,11 +5,14 @@ runtimes** — the spec-17 driver linked into the R interpreter — from
 pristine CRAN release tarballs, in the pinned tpkg-builder containers,
 for every platform the matrix declares.
 
-**Status: pre-release skeleton.** One platform leg (linux-gnu x86_64),
-one R line (4.6.x, catalog `4.6.2`), no publish pipeline, no signing,
-no release monitor. Everything lands through draft PRs (the ecosystem's
-hard rule: nothing touches `main`, tags, or releases without the owner's
-explicit go-ahead). The follow-ups section names the next increments.
+**Status: pre-release, full POSIX census.** Five legs (linux-gnu
+x86_64, linux-musl x86_64/aarch64, macOS x86_64/arm64), one R line
+(4.6.x, catalog `4.6.2`), the publish/sign/registry pipeline wired
+(publish.yml + the tebako-release machinery). No release has been cut —
+the first release is the owner's explicit act, and everything lands
+through draft PRs (the ecosystem's hard rule: nothing touches `main`,
+tags, or releases without the owner's explicit go-ahead). The
+follow-ups section names the next increments.
 
 ## The wedge: CI / headless Rscript
 
@@ -131,9 +134,10 @@ one:
 | readline | off | Interactive/IDE surface; would drag libtinfo into the closure |
 | ICU | off | Collation falls back to R's own; libicu is not on a bare system |
 | OpenMP | off | libgomp is not on a bare system; the parallel increment revisits with a static libgomp |
+| NLS | off | The translation catalogs are the interactive surface; and on musl the NLS probe links gettext's libintl into the exe (glibc folds gettext into libc, so gnu never leaks it) — off uniformly, one feature set on every leg |
 | libR as a shared lib | off | `R.bin` links libR **statically** — the exe must start standalone to boot the driver |
-| BLAS | static objects (R's own) | R.bin's appl objects call BLAS directly, and upstream builds its *included* BLAS only as the shared `libRblas.so` — an exe that NEEDs it cannot boot the driver (ld.so resolves NEEDED before `main()`, before any mount). The Makefile substitution links the included BLAS's *objects* into R.bin instead (the same objects libRblas.so carries); `libRblas.so` still ships in `lib/R/lib` for `libRlapack.so`, resolved through the dylib `$ORIGIN` rpath |
-| LAPACK | in-image shared | R's included LAPACK builds as `lib/R/lib/libRlapack.so`, reached only through the dlopen'd lapack module (never at exec) and resolved through the `$ORIGIN` rpath (two entries cover both shlib depths — `lib/R/modules` and `lib/R/library/<pkg>/libs`); lapack.so NEEDs `libRblas.so` **directly** (substitution 5's `--no-as-needed` pin — the toolchain's spec default would drop the reference-free library, and the exec_closure walk materializes only direct dependencies); a system/vendor LAPACK opt-in is follow-up |
+| BLAS | static objects (R's own) | R.bin's appl objects call BLAS directly, and upstream builds its *included* BLAS only as the shared `libRblas.so` — an exe that NEEDs it cannot boot the driver (ld.so resolves NEEDED before `main()`, before any mount). The Makefile substitution links the included BLAS's *objects* into R.bin instead (the same objects libRblas.so carries); `libRblas.so`/`libRblas.dylib` still ships in `lib/R/lib` for libRlapack, resolved through the dylib `$ORIGIN`/`@loader_path` rpath |
+| LAPACK | in-image shared | R's included LAPACK builds as `lib/R/lib/libRlapack.{so,dylib}`, reached only through the dlopen'd lapack module (never at exec) and resolved through the `$ORIGIN`/`@loader_path` rpath (two entries cover both shlib depths — `lib/R/modules` and `lib/R/library/<pkg>/libs`); the lapack module loads libRblas **directly** (linux: substitution 5's `--no-as-needed` pin — the toolchain's spec default would drop the reference-free library; darwin: ld64 records every linked dylib, and the install-name fixup respells the rows `@rpath/` — dyld consults LC_RPATH only for @rpath names — and the exec_closure walk materializes only direct dependencies); a system/vendor LAPACK opt-in is follow-up |
 | libcurl | static (factory-built) | R 4.6 requires libcurl with https — no `--without-libcurl` exists upstream. The factory builds a minimal static libcurl itself (http/https/ftp only, TLS via the factory-built static OpenSSL 3 LTS — Apache-2.0, providers built in; the container's OpenSSL 1.1.1 is EOL), nothing else — the distro libcurl's encumbered closure never enters. https works from inside the runtime and the closure stays static |
 | libzstd / libdeflate | pinned off | Same deterministic-closure rule (both join the link whenever a build host happens to have them); lazy-load databases stay gzip/xz/bzip2 |
 | zlib | static (factory-built) | R links `-lz` into internet.so, a shared object, and the toolchain's `libz.a` carries no PIC (ld rejects it in a shared link) — the factory builds its own -fPIC static zlib and the `-L` pin fronts it for every `-lz` |
@@ -197,13 +201,39 @@ tools/boot_smoke                bare/boot/payload/compute-floor/
 
 ## Matrix grammar
 
-`.github/matrix.json` carries the env vocabulary (one row today:
+`.github/matrix.json` carries the env vocabulary (five rows:
 `ubuntu-22.04` × `tpkg-builder-x86_64-linux-gnu` × `linux-gnu` ×
-`x86_64`); `scripts/compute_matrix.rb` crosses it with the contract's
-version sets under the dispatch filters (`R_FILTER`, `PLATFORM_FILTER`,
-`ARCH_FILTER`) and emits the legs. `build-linux-gnu.yml` is the thin
-trigger; `_build-platform.yml` runs parity → compute → preflight →
-build → verify.
+`x86_64`; `ubuntu-22.04` × `tpkg-builder-x86_64-linux-musl` ×
+`linux-musl` × `x86_64`; `ubuntu-22.04-arm` ×
+`tpkg-builder-aarch64-linux-musl` × `linux-musl` × `arm64`;
+`macos-15-intel` × `macos` × `x86_64`; `macos-15` × `macos` × `arm64` —
+the linux legs docker-run the pinned tpkg-builder image, the macOS legs
+are runner-native on the runner's CLT + Homebrew gfortran);
+`scripts/compute_matrix.rb` crosses it with the contract's version sets
+under the dispatch filters (`R_FILTER`, `PLATFORM_FILTER`,
+`ARCH_FILTER`) and emits the legs. `build-linux-gnu.yml`,
+`build-linux-musl.yml`, and `build-macos.yml` are the thin triggers;
+`_build-platform.yml` runs parity → compute → preflight → build →
+publish → verify. `publish.yml` is the release coordinator (per-leg
+publish + sign from `_build-platform.yml`, then the one release job:
+the whole-matrix audit, the registry render, the bot PR, the aggregate
+nudge).
+
+## The publish pipeline
+
+The tebako-release machinery pin rides `contract.yml`'s
+`release_tooling` (the Gemfile reads it — the SSOT), adapted by
+`scripts/release_adapter.rb` (the R grammar: version lines, the
+`r` language segment, this repo's coordinates). Each leg's publish job
+uploads its write-once names (payload + `.sha256` sidecars +
+`.manifest.json` shard) and signs every served name (gated on
+`TEBAKO_RELEASE_SIGNING_ENABLED` / `…_KEYID` /
+`TEBAKO_RELEASE_SIGNING_KEY`); the macOS legs sign + notarize the exe
+in-leg first (spec 31, `ci/macos-sign-notarize-runtime.sh`, gated on
+`APPLE_SIGNING_ENABLED` — sign-then-hash: every downstream gate and the
+`.sha256` anchor the exact signed bytes). `tools/registry_update.rb`
+renders the registry mirror from the release's shards (spec 04 §2) and
+the coordinator lands it on main by bot PR + auto-merge.
 
 ## contract.yml — the pins
 
@@ -238,14 +268,24 @@ contract.yml / versions.yml       the pins (SSOT)
 
 ## Follow-ups (the named next increments)
 
-- **More triplets**: linux-musl x86_64/aarch64, macos (both arches —
-  the fs TU already carries the `_NSGetExecutablePath` arm), windows
-  (the spec 17 §7 materialize tier — the fs TU grows that branch then).
-- **Publish + signing + the release monitor**: the tebako-release
-  machinery pin, the publish.yml coordinator, the registry shard.
-- **Toolchain baking**: gfortran + liblzma-dev + libpcre2-dev into the
-  tpkg-builder image (tebako-ci-containers), retiring the in-leg apt
-  provisioning.
+- **Windows** (ucrt x64 — evaluated, deferred as a materially different
+  fight): R on windows does NOT build through autotools — it builds
+  through `src/gnuwin32`'s hand-maintained Makefiles with an
+  `MkRules.local` feature sheet, so this factory's
+  configure/substitution layer grows a whole second build driver, not a
+  flag. The toolchain is Rtools/MSYS2 ucrt plus the prebuilt extsoft
+  bundle (a different provisioning story than the POSIX deps stage),
+  the gfortran/BLAS closure needs its own static proof under mingw
+  (libgfortran/libquadmath exist as static archives in Rtools, but the
+  PE loader has no rpath — the spec 22 PE walk + the spec 17 §7
+  materialize tier serve the deps from the extracted tree), and the exe
+  surface differs (Rterm.exe/Rscript.exe are both native — no
+  shell-script wedge on windows, but the fs TU grows its windows
+  branch then). The python/ruby factories prove the tier; the R
+  gnuwin32 driver is the named blocker.
+- **Toolchain baking**: gfortran + liblzma-dev + libpcre2-dev (gnu),
+  gfortran + the -static splits + tzdata (musl) into the tpkg-builder
+  images (tebako-ci-containers), retiring the in-leg provisioning.
 - **The recommended-packages decision**: ship the MASS-class set as a
   first-class payload slice (press-time composition) rather than in the
   runtime image.
@@ -257,3 +297,6 @@ contract.yml / versions.yml       the pins (SSOT)
   closure-audited the same way.
 - **The boot-contract parity spec/** (rspec), and a hello-runtimes arm
   once payloads exist.
+- **The first release**: an operator act — bump `VERSION`, dispatch
+  `publish.yml` (r_filter=full, platform=all, publish=true), and the
+  pipeline builds, signs, audits, and renders the registry.

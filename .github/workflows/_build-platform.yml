@@ -13,7 +13,7 @@
 #
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
 # ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
-# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
 # PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS
 # BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
 # CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
@@ -24,11 +24,10 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 # The ONE per-platform build workflow (tebako-runtime-php's
-# _build-platform.yml port, at this factory's skeleton scope — the
-# linux-gnu container leg only; no publish/sign jobs, no macos arms,
-# no windows legs: those increments are named in README.md). Called by
-# the thin platform trigger (build-linux-gnu.yml) — never dispatched
-# directly.
+# _build-platform.yml port, at this factory's scope — no windows legs:
+# that increment is named in README.md). Called by the three thin platform
+# triggers (build-<platform>.yml) and by the publish.yml coordinator —
+# never dispatched directly.
 #
 # Stage 0 (parity): the contract gate's driver-source parity arm needs the
 #   pinned link-unit release's lib.rs — a raw.githubusercontent.com fetch
@@ -51,29 +50,51 @@
 #   before any leg spends compute; the legs then pull name:tag@digest, so
 #   the toolchain container can never move under the matrix.
 # Stage 3 (build): one leg per (R x arch) of this platform:
-#   tools/build_runtime -> ci/check_symbol_provenance.sh ->
+#   tools/build_runtime -> the macOS sign+notarize arm (spec 31, gated on
+#   APPLE_SIGNING_ENABLED) -> ci/check_symbol_provenance.sh ->
 #   tools/boot_smoke -> the runtime-packages-<os>-<arch>-<r> artifact.
 #   The build scripts fetch and sha256-verify every input themselves (the
 #   pinned source tarball off versions.yml, the pinned link unit, the tfs
 #   CLI) — there is NO source-build path for the driver stack here
 #   (contract.yml's link_unit_release comment), so the ruby factory's
 #   whole link-unit staging job has no counterpart.
+# Stage 4 (publish + sign): the publish job — one leg per (R x arch),
+#   re-running THIS leg's artifact handoff. The leg that built a package
+#   publishes it (the tebako-release gem's uploader) and signs its served
+#   names (the gem's signer) — spec 13 §2a's de-rendezvous
+#   (tebako-runtime-ruby#161's pattern): write-once per-leg names, no
+#   shared release-asset mutation, so N legs publish concurrently with
+#   zero rendezvous and one failed leg no longer blocks the green legs'
+#   packages. The publish job is a SEPARATE job from the build
+#   (tebako-runtime-ruby#190): GitHub's re-run granularity is the job, so
+#   a publish-layer failure re-runs as a minutes-long download + upload,
+#   never a rebuild. The coordinator (publish.yml) keeps ONE release job:
+#   the read-only audit of the whole matrix against the release.
 #
-# The build leg provisions IN-CONTAINER (contract.yml's container note):
-# the v1 tpkg-builder gnu image lacks gfortran (R's internal LAPACK is
-# Fortran), and liblzma-dev and libpcre2-dev (R 4.6 dropped its bundled
-# xz and pcre2), so the build step apt-installs them before configure.
-# The named follow-up is baking the three into tebako-ci-containers —
-# see docs/build-chain.md. (No libssl-dev and no zlib1g-dev reliance:
-# the deps stage builds its own static OpenSSL 3 — the focal image's
-# 1.1.1 is EOL and too old for curl 8.23 — and its own -fPIC static
-# zlib, because the image's libz.a carries no PIC and internet.so links
-# -lz into a shared object.)
+# The build legs provision IN-LEG (contract.yml's container note): the
+# gnu image apt-installs gfortran (R's internal LAPACK is Fortran),
+# liblzma-dev, and libpcre2-dev (R 4.6 dropped its bundled xz and
+# pcre2); the musl image apk-installs gfortran, bzip2-dev +
+# bzip2-static, xz-dev + xz-static, pcre2-dev, and tzdata (R's
+# configure runs a date-time conversion probe that needs the zone
+# database; alpine splits the static archives into -static packages;
+# pcre2-dev ships libpcre2-8.a directly). The named follow-up is
+# baking them into
+# tebako-ci-containers — see docs/build-chain.md. (No libssl-dev and no
+# zlib1g-dev reliance: the deps stage builds its own static OpenSSL 3 —
+# the focal image's 1.1.1 is EOL and a bare musl target has no libssl —
+# and its own -fPIC static zlib, because the gnu image's libz.a carries
+# no PIC and internet.so links -lz into a shared object. The macOS legs
+# link libz/libbz2/libcurl against macOS's own dylibs and build only
+# pcre2/xz in the deps stage — the SDK ships their stubs without the
+# headers.)
 #
 # Container grammar (the other factories'): the linux legs run on the
-# ubuntu host and docker-run the tpkg-builder image per step (the job-
-# level container: form is out — the musl image is alpine-based and node
-# actions cannot run on musl, and uniformity beats a per-image branch).
+# ubuntu host and docker-run the tpkg-builder image per step — the musl
+# image is alpine-based and node actions cannot run on musl, so the
+# job-level container: form is out. macos legs are runner-native (the
+# toolchain is the runner's CLT + the image's Homebrew gfortran; the
+# provenance gate's Mach-O arm proves the closure stays system-only).
 #
 # The cache holds ONLY the sha256-verified downloads (.build/downloads)
 # and the staged link unit (.build/link-unit): a restored entry re-verifies
@@ -88,7 +109,7 @@ on:
   workflow_call:
     inputs:
       platform:
-        description: 'This call''s platform: linux-gnu'
+        description: 'This call''s platform: linux-gnu | linux-musl | macos'
         required: true
         type: string
       r_filter:
@@ -99,6 +120,27 @@ on:
         description: 'Arch slice: "all" or an arch (x86_64 | arm64)'
         type: string
         default: 'all'
+      audit:
+        description: 'Audit only: compute the legs, build nothing (publish.yml''s audit mode)'
+        type: boolean
+        default: false
+      publish:
+        description: 'Publish each leg''s runtime package to the release and sign its served names (spec 13 §2a / spec 09 §5)'
+        type: boolean
+        default: false
+    outputs:
+      run:
+        description: '"true" when this platform has legs under the filters (set in audit mode too — the audit reads the expectations)'
+        value: ${{ jobs.compute.outputs.run }}
+      tebako_version:
+        description: 'The runtime package version (the VERSION file)'
+        value: ${{ jobs.compute.outputs.tebako_version }}
+      env_matrix:
+        description: 'The selected matrix.json rows (+ host_id) as JSON — the release job''s EXPECTED_ENV_MATRIX'
+        value: ${{ jobs.compute.outputs.env_matrix }}
+      r_matrix:
+        description: 'The selected R versions as JSON — the release job''s EXPECTED_R_MATRIX'
+        value: ${{ jobs.compute.outputs.r_matrix }}
 
 env:
   CACHE_VER: 1
@@ -125,7 +167,9 @@ jobs:
       - name: Fetch the pinned driver's parity source
         run: bundle exec scripts/check_contract.rb --fetch-parity .build/parity/lib.rs
 
-      # Artifact names are per workflow RUN.
+      # Artifact names are per workflow RUN: publish.yml calls this
+      # workflow once per platform inside one run, so the platform suffix
+      # keeps the three calls' artifacts distinct.
       - name: Upload the parity source
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -142,6 +186,8 @@ jobs:
       leg_count: ${{ steps.emit.outputs.leg_count }}
       legs: ${{ steps.emit.outputs.legs }}
       tebako_version: ${{ steps.emit.outputs.tebako_version }}
+      env_matrix: ${{ steps.emit.outputs.env_matrix }}
+      r_matrix: ${{ steps.emit.outputs.r_matrix }}
       container_version: ${{ steps.emit.outputs.container_version }}
       container_digests: ${{ steps.emit.outputs.container_digests }}
       source_date_epoch: ${{ steps.get-sde.outputs.epoch }}
@@ -196,6 +242,8 @@ jobs:
               abort("contract.yml declares no container_digests") if d.nil? || d.empty?
               print JSON.generate(d)
             ')"
+            echo "env_matrix=$(scripts/compute_matrix.rb --format env)"
+            echo "r_matrix=$(scripts/compute_matrix.rb --format rs)"
           } >> "$GITHUB_OUTPUT"
           # Mirror the plan to the LOG: values written only to
           # $GITHUB_OUTPUT leave no diagnosable record when the legs skip.
@@ -272,10 +320,11 @@ jobs:
   build:
     name: ${{ matrix.r }} / ${{ matrix.os }}-${{ matrix.arch }}
     needs: [compute, preflight]
-    # An unguarded empty matrix poisons the run conclusion. No always()
-    # here: a FAILED preflight (a moved toolchain container) must skip
-    # the legs outright — the verify job reports it by name.
-    if: ${{ needs.compute.outputs.run == 'true' }}
+    # An unguarded empty matrix poisons the run conclusion; an audit run
+    # builds nothing (publish.yml's audit mode verifies the RELEASE). No
+    # always() here: a FAILED preflight (a moved toolchain container)
+    # must skip the legs outright — the verify job reports it by name.
+    if: ${{ needs.compute.outputs.run == 'true' && !inputs.audit }}
     runs-on: ${{ matrix.host }}
     # A hung leg fails loudly at the cap, never silently (the ruby
     # factory's 150-minute record is the reference).
@@ -308,16 +357,31 @@ jobs:
           key: tebako-r-dl-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('contract.yml', 'versions.yml') }}-v${{ env.CACHE_VER }}
           save-always: true
 
+      # --- provisioning (the host-native macos legs only; the container
+      # legs' toolchain is baked into the tpkg-builder image plus the
+      # in-container package installs inside the build step below) ------
+      - name: Setup Ruby (the build tooling's interpreter)
+        if: matrix.os == 'macos'
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: '3.3'
+          bundler-cache: false
+
       # --- build (the container legs docker-run the digest-pinned
       # tpkg-builder image per step — the preflight proved the pin).
-      # The in-container apt provisioning is the header's named follow-up:
-      # gfortran (the internal LAPACK is Fortran), liblzma-dev, and
-      # libpcre2-dev (R 4.6 dropped its bundled xz/pcre2) are not baked
-      # into the v1 image. The toolchain PPA (ppa.launchpad.net)
-      # intermittently 503s mid-fetch; the apt phase therefore repoints
-      # the source at ppa.launchpadcontent.net (same content, steady)
-      # and retries. ---------------------------------------------------
+      # The in-container provisioning is the header's named follow-up:
+      # gnu apt-installs gfortran-11 + liblzma-dev + libpcre2-dev (R's
+      # internal LAPACK is Fortran; R 4.6 dropped its bundled xz/pcre2)
+      # through the PPA-mirror retry (ppa.launchpad.net intermittently
+      # 503s mid-fetch — the repoint at ppa.launchpadcontent.net is the
+      # same content, steady); musl apk-installs gfortran + bzip2-dev +
+      # bzip2-static + xz-dev + xz-static + pcre2-dev + tzdata (the
+      # configure date-time probe needs the zone database; alpine
+      # splits the static archives into -static packages; alpine's
+      # mirrors need no mirror dance, but a transient fetch still
+      # earns the bounded retry). ---
       - name: Build the runtime (container legs)
+        if: matrix.container != null
         env:
           CONTAINER_DIGESTS: ${{ needs.compute.outputs.container_digests }}
         run: |
@@ -337,27 +401,45 @@ jobs:
             -v "${{ github.workspace }}:/mnt/w" -w /mnt/w \
             "$image" bash -c '
               set -e
-              grep -rl "ppa\.launchpad\.net" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | \
-                while read -r f; do sed -i "s/ppa\.launchpad\.net/ppa.launchpadcontent.net/g" "$f"; done
-              ok=0
-              for i in 1 2 3 4 5 6; do
-                apt-get update -qq 2>&1 | tee /tmp/apt-update.log > /dev/null || true
-                if ! grep -q "Failed to fetch" /tmp/apt-update.log && apt-cache policy gfortran-11 | grep -q "Candidate: [0-9]"; then
-                  ok=1; break
-                fi
-                echo "apt update attempt $i incomplete (PPA hiccup); retrying in 20s"; sleep 20
-              done
-              [ "$ok" = 1 ] || { echo "the toolchain PPA index never came back"; exit 1; }
-              ok=0
-              for i in 1 2 3 4 5 6; do
-                if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-                  gfortran-11 liblzma-dev libpcre2-dev > /tmp/apt-install.log 2>&1; then
-                  ok=1; break
-                fi
-                echo "apt install attempt $i failed (PPA hiccup); retrying in 20s"; tail -3 /tmp/apt-install.log; sleep 20
-              done
-              [ "$ok" = 1 ] || { echo "the toolchain PPA pool never came back"; exit 1; }
-              update-alternatives --install /usr/bin/gfortran gfortran /usr/bin/gfortran-11 110
+              case "${{ matrix.os }}" in
+                linux-gnu)
+                  grep -rl "ppa\.launchpad\.net" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | \
+                    while read -r f; do sed -i "s/ppa\.launchpad\.net/ppa.launchpadcontent.net/g" "$f"; done
+                  ok=0
+                  for i in 1 2 3 4 5 6; do
+                    apt-get update -qq 2>&1 | tee /tmp/apt-update.log > /dev/null || true
+                    if ! grep -q "Failed to fetch" /tmp/apt-update.log && apt-cache policy gfortran-11 | grep -q "Candidate: [0-9]"; then
+                      ok=1; break
+                    fi
+                    echo "apt update attempt $i incomplete (PPA hiccup); retrying in 20s"; sleep 20
+                  done
+                  [ "$ok" = 1 ] || { echo "the toolchain PPA index never came back"; exit 1; }
+                  ok=0
+                  for i in 1 2 3 4 5 6; do
+                    if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+                      gfortran-11 liblzma-dev libpcre2-dev > /tmp/apt-install.log 2>&1; then
+                      ok=1; break
+                    fi
+                    echo "apt install attempt $i failed (PPA hiccup); retrying in 20s"; tail -3 /tmp/apt-install.log; sleep 20
+                  done
+                  [ "$ok" = 1 ] || { echo "the toolchain PPA pool never came back"; exit 1; }
+                  update-alternatives --install /usr/bin/gfortran gfortran /usr/bin/gfortran-11 110
+                  ;;
+                linux-musl)
+                  ok=0
+                  for i in 1 2 3; do
+                    # bzip2-dev/xz-dev carry the headers; the STATIC
+                    # archives ride alpine's -static split packages
+                    # (pcre2-dev ships libpcre2-8.a directly).
+                    if apk add --no-cache gfortran bzip2-dev bzip2-static xz-dev xz-static pcre2-dev tzdata > /tmp/apk.log 2>&1; then
+                      ok=1; break
+                    fi
+                    echo "apk attempt $i failed (mirror hiccup); retrying in 15s"; tail -3 /tmp/apk.log; sleep 15
+                  done
+                  [ "$ok" = 1 ] || { echo "the apk installs never landed"; exit 1; }
+                  ;;
+                *) echo "::error::no in-container provisioning for ${{ matrix.os }}"; exit 1 ;;
+              esac
               tools/build_runtime --r "${{ matrix.r }}"
               # Root in the container writes root-owned files onto the
               # bind mount; hand them back to the runner user so the host
@@ -365,8 +447,38 @@ jobs:
               uid=$(stat -c %u /mnt/w/contract.yml); gid=$(stat -c %g /mnt/w/contract.yml)
               chown -R "$uid:$gid" /mnt/w/.build /mnt/w/runtime-packages 2>/dev/null || true'
 
-      # --- the gates ------------------------------------------------------
+      - name: Build the runtime (macos)
+        if: matrix.os == 'macos'
+        run: tools/build_runtime --r "${{ matrix.r }}"
+
+      # Spec 31 §5/§8.4: sign (Developer ID Application, hardened
+      # runtime, the ci/runtime.entitlements pair) + notarize the macOS
+      # runtime exe IN-LEG, before the symbol-provenance check and the
+      # boot smoke — every downstream gate, and the publish stage's
+      # .sha256 sidecar, anchors the exact SIGNED bytes (sign-then-hash
+      # is mandatory). Gated on the repo variable APPLE_SIGNING_ENABLED
+      # (unsigned stays first-class without it — spec 00 invariant 7;
+      # armed + a missing secret is a fast named failure).
+      - name: Sign + notarize the runtime exe (macos, spec 31)
+        if: matrix.os == 'macos'
+        shell: bash
+        env:
+          APPLE_SIGNING_ENABLED: ${{ vars.APPLE_SIGNING_ENABLED }}
+          APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_ASC_KEY_P8: ${{ secrets.APPLE_ASC_KEY_P8 }}
+          APPLE_ASC_KEY_ID: ${{ secrets.APPLE_ASC_KEY_ID }}
+          APPLE_ASC_ISSUER_ID: ${{ secrets.APPLE_ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          runtime="tebako-runtime-${{ needs.compute.outputs.tebako_version }}-r-${{ matrix.r }}-${{ matrix.host_id }}"
+          bash ci/macos-sign-notarize-runtime.sh "runtime-packages/$runtime"
+
+      # --- the gates (a red gate skips the publish below, and the
+      # release job's audit then fails the run loudly) ------------------
       - name: Check symbol provenance (container legs)
+        if: matrix.container != null
         env:
           CONTAINER_DIGESTS: ${{ needs.compute.outputs.container_digests }}
         run: |
@@ -386,11 +498,18 @@ jobs:
               ci/check_symbol_provenance.sh --exe \
                 "runtime-packages/tebako-runtime-${{ needs.compute.outputs.tebako_version }}-r-${{ matrix.r }}-${{ matrix.host_id }}"'
 
+      - name: Check symbol provenance (macos)
+        if: matrix.os == 'macos'
+        run: |
+          ci/check_symbol_provenance.sh --exe \
+            "runtime-packages/tebako-runtime-${{ needs.compute.outputs.tebako_version }}-r-${{ matrix.r }}-${{ matrix.host_id }}"
+
       # The boot smoke resolves the exe from TEBAKO_RUNTIME_ROOT.
       # TEBAKO_TFS names the tfs CLI the build fetched (the fixture-image
       # scenarios pack with it) — inside the container legs it is the
-      # gnu binary matching the image.
+      # musl/gnu binary matching the image.
       - name: Boot smoke (container legs)
+        if: matrix.container != null
         env:
           CONTAINER_DIGESTS: ${{ needs.compute.outputs.container_digests }}
         run: |
@@ -412,31 +531,168 @@ jobs:
               export TEBAKO_TFS
               tools/boot_smoke'
 
-      # The leg's workspace, kept for a day as build diagnostics: one
-      # artifact per (platform, arch, R) leg, immutable across the run's
-      # attempts. Uploads even when the build or boot smoke failed
+      - name: Boot smoke (macos)
+        if: matrix.os == 'macos'
+        env:
+          TEBAKO_RUNTIME_ROOT: runtime-packages
+          # The compute-floor carve-out (tebako-runtime-python#79): the
+          # x86_64 legs carry the LIVE ~3x slow-compute defect on real
+          # Intel silicon whose root cause is the product repo's
+          # (tebako#1095) — warn-only there so the factory stays green
+          # while the fix ships; every other leg keeps the fail-closed
+          # default (tools/boot_smoke's COMPUTE_FLOOR_MODE contract).
+          # REMOVAL CONDITION: delete this line when tebako#1095 closes.
+          COMPUTE_FLOOR_MODE: ${{ matrix.arch == 'x86_64' && 'warn' || 'fail' }}
+        run: |
+          set -euo pipefail
+          TEBAKO_TFS=$(echo .build/downloads/tfs/*/tfs-*)
+          export TEBAKO_TFS
+          tools/boot_smoke
+
+      # The leg-complete marker (tebako-runtime-ruby#190): written only
+      # when every gate above passed — a failed step stops the job before
+      # this point (default step gating). The diagnostics upload below is
+      # always(), so a red leg's partial packages DO ship as an artifact;
+      # the publish job refuses any artifact without this marker.
+      - name: Mark the leg complete
+        shell: bash
+        run: touch runtime-packages/.leg-complete
+
+      # The leg's workspace, kept for a day as build diagnostics AND as
+      # the publish job's input (tebako-runtime-ruby#190's split): one
+      # artifact per (platform, arch, R) leg, immutable across the
+      # run's attempts — a re-run publish leg re-downloads exactly these
+      # bytes. Uploads even when the build or boot smoke failed
       # (always()) — a red leg's packages are exactly the ones worth
-      # diagnosing.
+      # diagnosing; the .leg-complete marker above is what keeps them
+      # unpublished.
       - name: Upload the runtime packages
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: runtime-packages-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.r }}
+          # include-hidden-files: the .leg-complete marker is dot-hidden
+          # (upload-artifact excludes dotfiles by default since v4.4) and
+          # IS the publish job's completeness gate.
           include-hidden-files: true
           path: runtime-packages
           retention-days: 1
+
+  # Spec 13 §2a (the de-rendezvous, tebako-runtime-ruby#161's pattern) as
+  # its OWN job (tebako-runtime-ruby#190): the leg that built a package
+  # publishes it — payload assets + .sha256 sidecars + the .manifest.json
+  # shard, write-once names this leg owns alone — and then signs every
+  # served name (spec 09 §5's no-fold rule). No shared file exists, so N
+  # legs publish concurrently with zero rendezvous. The split is the
+  # recovery story: GitHub's re-run granularity is the job, so a
+  # publish-layer failure re-runs as a minutes-long download + upload of
+  # the immutable in-run artifact — never a rebuild (the 2026-09-23
+  # wedge cost a full-catalog rebuild before this job existed).
+  publish:
+    name: publish ${{ matrix.r }} / ${{ matrix.os }}-${{ matrix.arch }}
+    needs: [compute, build]
+    # always(): one failed build leg must not skip the GREEN legs'
+    # publishes — the de-rendezvous holds across jobs. A leg whose build
+    # failed ships no complete artifact; its publish leg fails named at
+    # the guards below.
+    if: ${{ always() && !cancelled() && needs.compute.outputs.run == 'true' && inputs.publish && !inputs.audit }}
+    # attestations/id-token: the SLSA L3 provenance arm at the leg tail
+    # (gated with the publish — the job's own if — so build/audit runs
+    # never attest).
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    # Runner-native on ubuntu-latest for every leg: the uploader is pure
+    # API work, and the signer auto-detects THIS host's tebako-pkg
+    # (linux-gnu-x86_64) — an OpenPGP detached signature over served bytes
+    # is host-independent.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.compute.outputs.legs) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the leg's runtime packages
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: runtime-packages-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.r }}
+          path: runtime-packages
+
+      - name: Guard the artifact's completeness
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.download.outcome }}" != "success" ]; then
+            echo "::error::no runtime-packages artifact for this leg — its build leg did not complete"
+            echo "(a loudly-skipped or failed build publishes nothing; fix the build leg, then re-run failed jobs)"
+            exit 1
+          fi
+          if [ ! -f runtime-packages/.leg-complete ]; then
+            echo "::error::the leg's artifact carries no .leg-complete marker — the build leg died before its gates passed; these partial bytes are not publishable"
+            exit 1
+          fi
+
+      - name: Setup Ruby (the release tooling)
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+
+      - name: Publish the leg's runtime package (spec 13 §2a)
+        shell: bash
+        env:
+          # The job-level runner GITHUB_TOKEN authenticates the release
+          # API calls (see publish.yml's header).
+          TEBAKO_VERSION: ${{ needs.compute.outputs.tebako_version }}
+          EXPECTED_ENV_MATRIX: '[{"os":"${{ matrix.os }}","arch":"${{ matrix.arch }}"}]'
+          EXPECTED_R_MATRIX: '["${{ matrix.r }}"]'
+          TEBAKO_RELEASE_SIGNING_ENABLED: ${{ vars.TEBAKO_RELEASE_SIGNING_ENABLED }}
+          TEBAKO_RELEASE_SIGNING_KEYID: ${{ vars.TEBAKO_RELEASE_SIGNING_KEYID }}
+        run: |
+          set -euo pipefail
+          bundle exec tebako-release upload
+
+      - name: Sign the leg's release assets (spec 09 §5)
+        shell: bash
+        env:
+          TEBAKO_VERSION: ${{ needs.compute.outputs.tebako_version }}
+          TEBAKO_RELEASE_SIGNING_ENABLED: ${{ vars.TEBAKO_RELEASE_SIGNING_ENABLED }}
+          TEBAKO_RELEASE_SIGNING_KEY: ${{ secrets.TEBAKO_RELEASE_SIGNING_KEY }}
+          SIGN_ONLY_STEMS: tebako-runtime-${{ needs.compute.outputs.tebako_version }}-r-${{ matrix.r }}-${{ matrix.host_id }}
+        run: bundle exec tebako-release sign
+
+      # SLSA L3 provenance over the exact bytes this leg ships — the staged
+      # runtime package + its .sha256 sidecars + the .manifest.json shard
+      # (plus the detached .asc when the signing arm ran: the signer
+      # converges them into this same dir). The .leg-complete marker is
+      # dot-hidden, so the glob never names it. Gated with the publish
+      # above (the job's own if) — build/audit runs never attest.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: runtime-packages/*
 
   # The terminal aggregate — and the branch-protection gate. The build
   # legs are a dynamic matrix whose check names shift with the catalog
   # (a version bump renames every leg), so protection pins this job's
   # stable per-platform check name ("<platform> / all legs green")
   # instead of any leg's. Green means: the contract/matrix computed, the
-  # container pins proved, and every emitted leg succeeded; a platform
-  # whose filter emits no legs gates on compute alone.
+  # container pins proved, every emitted leg succeeded, and — on publish
+  # runs — every publish leg landed (tebako-runtime-ruby#190: the gate
+  # depends on the publish jobs, not only the builds); a platform whose
+  # filter emits no legs gates on compute alone. Audit runs (publish.yml's
+  # audit mode) build nothing and skip this job.
   verify:
     name: all legs green
-    needs: [parity, compute, preflight, build]
-    if: ${{ always() && !cancelled() }}
+    needs: [parity, compute, preflight, build, publish]
+    if: ${{ always() && !cancelled() && !inputs.audit }}
     runs-on: ubuntu-latest
     steps:
       - name: Gate on the legs
@@ -446,6 +702,7 @@ jobs:
           echo "compute:   ${{ needs.compute.result }} (run=${{ needs.compute.outputs.run }}, legs=${{ needs.compute.outputs.leg_count }})"
           echo "preflight: ${{ needs.preflight.result }}"
           echo "build:     ${{ needs.build.result }}"
+          echo "publish:   ${{ needs.publish.result }} (requested=${{ inputs.publish }})"
           if [ "${{ needs.compute.result }}" != "success" ]; then
             echo "::error::the contract/matrix computation failed"
             exit 1
@@ -456,5 +713,12 @@ jobs:
           fi
           if [ "${{ needs.compute.outputs.run }}" = "true" ] && [ "${{ needs.build.result }}" != "success" ]; then
             echo "::error::not every ${{ inputs.platform }} leg succeeded: ${{ needs.build.result }}"
+            exit 1
+          fi
+          # A publish-requested run gates on the publish legs too (the job
+          # is skipped outright when publish was not requested — that is
+          # the success() semantics for a non-publish run).
+          if [ "${{ inputs.publish }}" = "true" ] && [ "${{ needs.compute.outputs.run }}" = "true" ] && [ "${{ needs.publish.result }}" != "success" ]; then
+            echo "::error::not every ${{ inputs.platform }} publish leg succeeded: ${{ needs.publish.result }}"
             exit 1
           fi

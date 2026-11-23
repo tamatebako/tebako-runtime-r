@@ -80,11 +80,15 @@
 #                        RBuild#recorded_cflags, itself gated at
 #                        configure time) — plus the interpreter's own
 #                        getRversion(). A mis-flagged build is a recipe
-#                        bug, never the slow-silicon defect class.
-#                        COMPUTE_FLOOR_MODE is accepted for shape parity
-#                        with the other factories; only "fail" is known
-#                        here — no leg carries a live slow-compute
-#                        waiver today.                                [all]
+#                        bug, never the slow-silicon defect class. Modes
+#                        (COMPUTE_FLOOR_MODE): "fail" (the default)
+#                        trips the leg; "warn" — armed by the workflow on
+#                        the macos-x86_64 leg ALONE, where the link-unit
+#                        line carries the LIVE ~3x slow-compute defect on
+#                        real Intel silicon (tebako#1095, still open) —
+#                        prints a ::warning:: and keeps the leg green.
+#                        REMOVAL CONDITION: that leg reverts to
+#                        fail-closed when tebako#1095 closes.      [all]
 #   bad-mount            --tebako-image <missing>:-:/nope -> exit 69
 #                        (the unavailable image, named on stderr)
 #   mount-root-override  TEBAKO_MOUNT_ROOT=<abs>: boots, R.home() follows
@@ -148,14 +152,17 @@ def usage_error(message)
 end
 
 # The compute-floor scenario's mode (its header block): "fail" — the
-# default and the only value this factory knows — trips the leg on a
-# breached floor. php's "warn" tier exists for a live product-repo
-# defect on one of ITS legs; no tebako-r leg carries such a waiver
-# today, so "warn" is a named error here rather than a silent no-op.
+# default, and every leg's shape but one — trips the leg on a breached
+# floor; "warn" prints the measurement + a workflow-command ::warning::
+# and keeps the leg green. The workflow arms "warn" on the macos-x86_64
+# leg ALONE: the live tebako#1095 slow-compute defect (the product
+# repo's, in the link-unit line this factory pins) would otherwise red
+# that leg until the fix ships. REMOVAL CONDITION: the leg reverts to
+# fail-closed when tebako#1095 closes. Any other value is a named error,
+# never a silent fallback.
 COMPUTE_FLOOR_MODE = ENV.fetch("COMPUTE_FLOOR_MODE", "fail")
-unless COMPUTE_FLOOR_MODE == "fail"
-  usage_error("COMPUTE_FLOOR_MODE=#{COMPUTE_FLOOR_MODE.inspect} — this factory knows only " \
-              "fail (the default); no leg carries a slow-compute waiver today")
+unless %w[fail warn].include?(COMPUTE_FLOOR_MODE)
+  usage_error("COMPUTE_FLOOR_MODE=#{COMPUTE_FLOOR_MODE.inspect} — known: fail (the default), warn")
 end
 
 options = { runtime_root: ENV.fetch("TEBAKO_RUNTIME_ROOT", nil), exe: nil, tfs: nil, scenario: "all" }
@@ -445,7 +452,22 @@ def run_scenarios(executable, platform, selected, tfs:)
         detail = "measured best #{best.inspect}s (runs in the log above) — a leg computing at a fraction " \
                  "of the matrix's rate is a slow BUILD, never a publishable artifact " \
                  "(tebako-runtime-python#79's lesson)\nstdout: #{out}\nstderr: #{err}"
-        check(floor, !best.nil? && best <= COMPUTE_FLOOR_SECONDS, detail)
+        if best.nil? || best > COMPUTE_FLOOR_SECONDS
+          if COMPUTE_FLOOR_MODE == "warn"
+            # The warn tier (the header block + the mode comment): the
+            # defect is LIVE on this leg's class, the root cause is the
+            # product repo's — the measurement and a workflow-command
+            # warning carry it, the leg stays green.
+            puts "::warning title=compute-floor::the #{COMPUTE_LOOP_N}-iteration loop best #{best.inspect}s past the " \
+                 "#{COMPUTE_FLOOR_SECONDS}s tripwire — the live tebako#1095 slow-compute defect on real " \
+                 "Intel silicon; this leg rides warn-only until tebako#1095 closes"
+            puts "warn #{floor}: #{detail}"
+          else
+            check(floor, false, detail)
+          end
+        else
+          check(floor, true, detail)
+        end
       when "bad-mount"
         missing = File.join(dir, "no-such-image.tfs")
         out, err, st = boot(executable,

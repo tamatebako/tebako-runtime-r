@@ -75,3 +75,17 @@ deps:
   curl:
     url: https://curl.se/download/curl-8.23.0.tar.gz
     sha256: e3de77cfa6367083c776a26647fc9f633b538c06c3baa73d931a252ac8f72b49
+  # The deps stage's second tier (the macOS legs): R 4.6 dropped its
+  # bundled xz and pcre2, and the macOS SDK ships their .tbd stubs
+  # WITHOUT the pcre2.h/lzma.h headers, so the system dylibs are
+  # unprobe-able (and a Homebrew find is tebako-runtime-python#80's leak
+  # class). The macOS legs build both from pinned source, -fPIC
+  # throughout; the linux legs take them from the toolchain's -dev
+  # packages instead (apt on gnu, apk on musl — the in-leg provisioning,
+  # proven to reach only R.bin's link).
+  pcre2:
+    url: https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.44/pcre2-10.44.tar.gz
+    sha256: 86b9cb0aa3bcb7994faa88018292bc704cdbb708e785f7c74352ff6ea7d3175b
+  xz:
+    url: https://github.com/tukaani-project/xz/releases/download/v5.8.1/xz-5.8.1.tar.gz
+    sha256: 507825b599356c10dca1cd720c9d0d0c9d5400b9de300af00e4d1ea150795543

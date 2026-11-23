@@ -22,17 +22,21 @@ workspace root) — read it first. The short version as applied here:
 - **YAML** for all authored config/manifests; named errors and named
   exit codes, never silent fallbacks.
 
-## Repo status: pre-release skeleton
+## Repo status: pre-release, full POSIX census
 
 `tools/build_runtime` is implemented (the tebako-runtime-php
 `build/lib` port, R edition): fetch/verify → configure/make → driver
-link → env-image pack → packaging → sidecars, gated by
-`ci/check_symbol_provenance.sh` and `tools/boot_smoke`. CI carries one
-platform workflow (`build-linux-gnu.yml` — a thin trigger over
-`_build-platform.yml`: parity → compute → preflight → build → verify)
-plus the static gate (`lint.yml`). **No publish pipeline, no signing,
-no release monitor, and no release has been cut** — the README's
-follow-ups section names the increments.
+link → (macOS: the @rpath install-name fixup) → env-image pack →
+packaging → sidecars, gated by `ci/check_symbol_provenance.sh` and
+`tools/boot_smoke`. CI carries three platform workflows
+(`build-linux-gnu.yml`, `build-linux-musl.yml`, `build-macos.yml` —
+thin triggers over `_build-platform.yml`: parity → compute → preflight
+→ build → publish → verify) plus the static gate (`lint.yml`). The
+publish pipeline (`publish.yml` + the tebako-release gem via
+`scripts/release_adapter.rb` + `tools/registry_update.rb`) is present,
+but **no release has been cut** — the first release is the owner's
+explicit act (README's follow-ups section names the remaining
+increments).
 
 ## Repo-local gotchas
 

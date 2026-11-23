@@ -79,6 +79,10 @@ container_version: "v1"
 container_digests:
   tpkg-builder-x86_64-linux-gnu:
     amd64: "sha256:6ab7d71bcae6b93bcba4e5201835d7135ee99b29f72755d7f4bb8f48b398ae90"
+  tpkg-builder-x86_64-linux-musl:
+    amd64: "sha256:e933e07cc7320b53fd558a3ede20728530bb0b1fbcf8100efc55f5ac80b97e2d"
+  tpkg-builder-aarch64-linux-musl:
+    arm64: "sha256:f3686d19035400fc87310fc2d38842ed24d3cf56bc95611a2b9000bfcbdf4ccf"
 
 # The published link-unit pin: the tamatebako/tebako release whose
 # prebuilt link unit (the spec-17 driver + scoped tfs + the native
@@ -97,6 +101,25 @@ container_digests:
 # allocation, no loader lock), the fix whose absence wedged the gnu legs
 # at first intercepted call. Contract unchanged (2).
 link_unit_release: "v2.8.66"
+
+# The macOS support floor stamped into the exe's LC_BUILD_VERSION minos
+# (MACOSX_DEPLOYMENT_TARGET through RBuild#floor_env): a product
+# decision, never the runner image's accident — a floor that floats with
+# the build host's OS ships an exe that refuses to load on older macOS
+# (tebako-runtime-python#81). Uniform across both macOS arches; the
+# provenance gate asserts the recorded minos equals this pin.
+macos_deployment_target: "14.0"
+
+# The release machinery's pin: the tamatebako/tebako-release-tooling tag
+# the Gemfile consumes (the single owner of the publish/sign/audit
+# machinery — ecosystem invariant 10), exercised by
+# scripts/release_adapter.rb — the repo carries no copy of the machinery.
+# v0.5.3 is the current tag (tebako-runtime-julia's pin): the windows
+# completeness gate consults the adapter's dll_install_name declaration,
+# so an exec-cache runtime (this factory's shape) is no longer demanded
+# a .dll facet it never publishes (tebako-runtime-julia's first v0.1.0
+# publish, run 45169138993, died on the unconditional expectation).
+release_tooling: "v0.5.3"
 
 # The R version catalog this factory builds (and will publish, once the
 # publish increment lands). The SOURCE PINS (url/sha256 per version) live
