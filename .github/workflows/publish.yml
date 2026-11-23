@@ -1,0 +1,442 @@
+# Copyright (c) 2026 [Ribose Inc](https://www.ribose.com).
+# All rights reserved.
+# This file is a part of tamatebako
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+# The release coordinator (tebako-runtime-php's publish.yml port — itself
+# tebako-runtime-python's port of the ruby factory's grammar — at this
+# factory's three platforms: no windows fan-out exists here). The
+# explicit, operator-facing entry point — the three first-class slice
+# shapes:
+#   one R on every platform  (r_filter=<version>, platform=all)
+#   one platform, every R    (r_filter=full|tidy|catalog, platform=<one>)
+#   one R on one platform    (r_filter=<version>, platform=<one>)
+# plus the era baseline (r_filter=catalog, platform=all).
+#
+# Every slice fans out to _build-platform.yml to BUILD, and — spec 13
+# §2a's de-rendezvous (tebako-runtime-ruby#161's pattern) — to PUBLISH
+# and SIGN from each leg's own publish job (tebako-runtime-ruby#190's
+# split): the leg that built a package uploads its write-once names
+# (payload + .sha256 sidecars + .manifest.json shard) and signs every
+# served name, publishing the bytes the build job handed off as an
+# immutable in-run artifact. No shared mutable file exists anymore (the
+# monolithic manifest.json / SHA256SUMS.txt are gone: the per-package
+# shard IS the release-index entry — the resolver's primary form — and a
+# consumer that wants the monolith shape derives it from the shards
+# locally), so N legs publish concurrently with zero rendezvous and one
+# failed leg no longer blocks the green legs' packages. What remains here
+# is the ONE release job per coordinator run: it AUDITS the whole matrix
+# against the release (read-only) — the one duty that genuinely needs the
+# full matrix. And a force_rebuild republication passes through the
+# prepare-release job first (tebako-runtime-ruby#189): the release OBJECT
+# is recreated under the kept tag, so every publish leg is a pure create
+# on a free namespace — the per-asset delete→re-upload wedge never gets
+# triggered.
+#
+# Deliberate deviations from the ruby coordinator (the python factory's,
+# inherited via php's):
+#   - publish defaults to FALSE (ruby: true): publishing is an explicit
+#     operator act.
+#   - The release job authenticates with the runner GITHUB_TOKEN, not the
+#     ruby grammar's `TEBAKO_CI_PAT_TOKEN || GITHUB_TOKEN` preference: the
+#     audit mutates only this repo's own release, the runner token's
+#     contents:write suffices, and no downstream cascade listens to this
+#     factory's releases yet. The registry bot PR is the exception:
+#     pushing its branch + opening/auto-merging the PR rides the PAT
+#     grammar like ruby's (the runner token's PRs trigger no checks, and
+#     main is protected).
+name: publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      r_filter:
+        description: 'Rs: "full" (line tips), "tidy", "catalog" (every published version), or comma-separated versions'
+        type: string
+        default: 'full'
+      platform:
+        description: 'Platform slice: "all" or one of linux-gnu | linux-musl | macos'
+        type: string
+        default: 'all'
+      arch_filter:
+        description: 'Optional arch slice within each platform (x86_64 | arm64)'
+        type: string
+        default: 'all'
+      publish:
+        description: 'Publish this run''s packages to the release'
+        type: boolean
+        default: false
+      force_rebuild:
+        description: 'Republication: recreate the release OBJECT under the kept tag, then publish fresh (tebako-runtime-ruby#189 — the one exception to per-name byte-immutability, and never a per-asset delete)'
+        type: boolean
+        default: false
+      audit:
+        description: 'Audit only: verify the release against the expected matrix, no builds/uploads'
+        type: boolean
+        default: false
+      registry_only:
+        description: 'Registry only: render + publish the registry from the release as it stands (needs registry_version; no builds, no audit gate)'
+        type: boolean
+        default: false
+      registry_version:
+        description: 'The published tebako version to render for (e.g. 0.1.0) — required with registry_only'
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  # The release job's registry bot PR (tebako-runtime-ruby's grammar).
+  pull-requests: write
+
+jobs:
+  # tebako-runtime-ruby#189: a force_rebuild republication never deletes
+  # individual assets — a deleted name 422-blocks re-uploads for hours
+  # server-side, and the wedge's scope is the release OBJECT (proven by
+  # probe: a fresh object under the same tag accepts the same names
+  # immediately). So a forced republication recreates the release object
+  # under the kept tag BEFORE any leg publishes; every publish leg on a
+  # fresh object is a pure create (the uploader's race-safe create
+  # arbitrates the legs' concurrent re-creation). Non-forced runs skip
+  # this job entirely (payload assets stay byte-immutable per name).
+  prepare-release:
+    name: Recreate the release object (force_rebuild)
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.registry_only && !inputs.audit && inputs.publish && inputs.force_rebuild }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Delete the release object, keeping the tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="v$(cat VERSION)"
+          # Idempotent: a missing object is already the recreated state
+          # (a re-run after a mid-air death). --cleanup-tag=false (the
+          # default, spelled out) keeps the tag on its commit.
+          gh release delete "$tag" --yes --cleanup-tag=false 2>/dev/null || \
+            echo "no release object for $tag — already the recreated state"
+          echo "release object for $tag recreated (tag kept) — every leg's publish is a pure create"
+
+  linux-gnu:
+    needs: prepare-release
+    # always() + !cancelled(): a SKIPPED prepare-release (the ordinary
+    # non-forced publish) must not skip the platform fan-out.
+    if: ${{ always() && !cancelled() && !inputs.registry_only && (inputs.platform == 'all' || inputs.platform == 'linux-gnu') }}
+    # attestations/id-token ride down to the called workflow's publish
+    # job (its SLSA L3 arm): a caller's grants cap the callee's.
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    uses: ./.github/workflows/_build-platform.yml
+    with:
+      platform: linux-gnu
+      r_filter: ${{ inputs.r_filter }}
+      arch_filter: ${{ inputs.arch_filter }}
+      audit: ${{ inputs.audit }}
+      publish: ${{ inputs.publish }}
+    secrets: inherit
+
+  linux-musl:
+    needs: prepare-release
+    if: ${{ always() && !cancelled() && !inputs.registry_only && (inputs.platform == 'all' || inputs.platform == 'linux-musl') }}
+    # attestations/id-token ride down to the called workflow's publish
+    # job (its SLSA L3 arm): a caller's grants cap the callee's.
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    uses: ./.github/workflows/_build-platform.yml
+    with:
+      platform: linux-musl
+      r_filter: ${{ inputs.r_filter }}
+      arch_filter: ${{ inputs.arch_filter }}
+      audit: ${{ inputs.audit }}
+      publish: ${{ inputs.publish }}
+    secrets: inherit
+
+  macos:
+    needs: prepare-release
+    if: ${{ always() && !cancelled() && !inputs.registry_only && (inputs.platform == 'all' || inputs.platform == 'macos') }}
+    # attestations/id-token ride down to the called workflow's publish
+    # job (its SLSA L3 arm): a caller's grants cap the callee's.
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    uses: ./.github/workflows/_build-platform.yml
+    with:
+      platform: macos
+      r_filter: ${{ inputs.r_filter }}
+      arch_filter: ${{ inputs.arch_filter }}
+      audit: ${{ inputs.audit }}
+      publish: ${{ inputs.publish }}
+    secrets: inherit
+
+  # The ONE release job per coordinator run. Spec 13 §2a's de-rendezvous
+  # moved the publish into the legs' own publish jobs (write-once per-leg
+  # names — no shared release-asset mutation remains); what serializes
+  # here is the two duties that need the whole matrix: the AUDIT (every
+  # platform's expected names verified against the release, read-only)
+  # and the registry render + bot PR (git arbitrates the PR — the
+  # concurrency group is politeness now, not correctness). A runner that
+  # dies mid-audit never reports, and the job-level group
+  # (cancel-in-progress: false) then holds every later audit hostage for
+  # the cap — bound it.
+  release:
+    name: Audit the release + publish the registry
+    needs: [linux-gnu, linux-musl, macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: publish-runtime-packages
+      cancel-in-progress: false
+    # Run when the run asked to publish or audit and at least one
+    # platform actually built (an audit builds nothing but still computes
+    # every selected platform's expectations) — or unconditionally under
+    # registry_only, which builds nothing and renders from the release
+    # as it stands.
+    if: ${{ always() && !cancelled() && (((inputs.publish || inputs.audit) && (needs.linux-gnu.result == 'success' || needs.linux-musl.result == 'success' || needs.macos.result == 'success')) || inputs.registry_only) }}
+    env:
+      # Runner GITHUB_TOKEN — the audit mutates only this repo's own
+      # release; see the header's deviation note.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The registry bot PR pushes the publish branch — that needs the
+          # PAT, not the runner's default token (see the header note).
+          token: ${{ secrets.TEBAKO_CI_PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      - name: Setup Ruby gems
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      # The audit, per platform that built: the legs' publish jobs already
+      # landed their packages, so this job never downloads a byte — it
+      # verifies each platform's expected names (payloads, .sha256
+      # sidecars, shards, and — on signing-enabled lines — every .asc,
+      # spec 09 §5) against the release's own listing, read-only (the
+      # gem's uploader under AUDIT_ONLY).
+      - name: Audit the release, per platform
+        if: ${{ !inputs.registry_only }}
+        env:
+          AUDIT_ONLY: "true"
+          TEBAKO_RELEASE_SIGNING_ENABLED: ${{ vars.TEBAKO_RELEASE_SIGNING_ENABLED }}
+          GNU_RUN: ${{ needs.linux-gnu.outputs.run }}
+          GNU_VER: ${{ needs.linux-gnu.outputs.tebako_version }}
+          GNU_ENV: ${{ needs.linux-gnu.outputs.env_matrix }}
+          GNU_R: ${{ needs.linux-gnu.outputs.r_matrix }}
+          MUSL_RUN: ${{ needs.linux-musl.outputs.run }}
+          MUSL_VER: ${{ needs.linux-musl.outputs.tebako_version }}
+          MUSL_ENV: ${{ needs.linux-musl.outputs.env_matrix }}
+          MUSL_R: ${{ needs.linux-musl.outputs.r_matrix }}
+          MAC_RUN: ${{ needs.macos.outputs.run }}
+          MAC_VER: ${{ needs.macos.outputs.tebako_version }}
+          MAC_ENV: ${{ needs.macos.outputs.env_matrix }}
+          MAC_R: ${{ needs.macos.outputs.r_matrix }}
+        run: |
+          set -uo pipefail
+          # Audit every platform that built green; THEN fail loudly naming
+          # any selected platform that did not — a green platform's audit
+          # always runs, and a coverage gap never goes unreported.
+          audit_failed=""
+          audit_platform() {
+            local run="$1" ver="$2" envm="$3" rm="$4" name="$5"
+            if [ "$run" != "true" ]; then
+              echo "--- $name did not build this run; skipping its audit"
+              return 0
+            fi
+            echo "=== auditing $name (tebako $ver)"
+            TEBAKO_VERSION="$ver" EXPECTED_ENV_MATRIX="$envm" EXPECTED_R_MATRIX="$rm" \
+              bundle exec tebako-release upload || audit_failed="$audit_failed $name"
+          }
+          audit_platform "$GNU_RUN"  "$GNU_VER"  "$GNU_ENV"  "$GNU_R"  linux-gnu
+          audit_platform "$MUSL_RUN" "$MUSL_VER" "$MUSL_ENV" "$MUSL_R" linux-musl
+          audit_platform "$MAC_RUN"  "$MAC_VER"  "$MAC_ENV"  "$MAC_R"  macos
+          failed=""
+          mark() { # $1=selected? $2=result $3=name
+            if [ "$1" = "true" ] && [ "$2" != "success" ] && [ "$2" != "skipped" ]; then
+              failed="$failed $3"
+            fi
+          }
+          mark "${{ inputs.platform == 'all' || inputs.platform == 'linux-gnu' }}"  "${{ needs.linux-gnu.result }}"  linux-gnu
+          mark "${{ inputs.platform == 'all' || inputs.platform == 'linux-musl' }}" "${{ needs.linux-musl.result }}" linux-musl
+          mark "${{ inputs.platform == 'all' || inputs.platform == 'macos' }}"      "${{ needs.macos.result }}"      macos
+          if [ -n "$failed" ]; then
+            echo "::error::these platforms were selected but did not build green — their packages did not land:$failed"
+          fi
+          if [ -n "$audit_failed" ]; then
+            echo "::error::these platforms' audits FAILED — the release is incomplete:$audit_failed"
+          fi
+          [ -z "$failed" ] && [ -z "$audit_failed" ]
+
+      # The registry mirror (spec 04 §2): rendered from the release's own
+      # shards — the write-once per-leg metadata units, ground truth —
+      # never from a job's local knowledge. One tebako version per
+      # coordinator run, so the first platform that built names it.
+      # always(): a red audit marks the RUN for a human but must not skip
+      # the mirror — the render only ever carries what the release itself
+      # carries, so mirroring after a partial publish stays truthful (the
+      # ruby factory's v0.16.27 lesson: a dogfood death skipped this step
+      # and the registry silently lagged the release until hand-rendered).
+      - name: Render the registry entries
+        if: ${{ always() && !cancelled() && !inputs.audit }}
+        env:
+          TEBAKO_VERSION: ${{ inputs.registry_only && inputs.registry_version || (needs.linux-gnu.outputs.tebako_version || needs.linux-musl.outputs.tebako_version || needs.macos.outputs.tebako_version) }}
+        run: |
+          if [ -z "$TEBAKO_VERSION" ]; then
+            echo "::error::registry_only needs registry_version (e.g. 0.1.0) — none given and no platform built one"
+            exit 1
+          fi
+          ./tools/registry_update.rb
+
+      # main is branch-protected: the registry lands by bot PR +
+      # auto-merge, never by direct push. Idempotent across re-runs of the
+      # same version (an unchanged registry exits before the branch).
+      - name: Publish the registry via pull request
+        if: ${{ always() && !cancelled() && !inputs.audit }}
+        env:
+          GH_TOKEN: ${{ secrets.TEBAKO_CI_PAT_TOKEN || secrets.GITHUB_TOKEN }}
+          TEBAKO_VERSION: ${{ inputs.registry_only && inputs.registry_version || (needs.linux-gnu.outputs.tebako_version || needs.linux-musl.outputs.tebako_version || needs.macos.outputs.tebako_version) }}
+        run: |
+          set -euo pipefail
+          [ -f tpkg-registry.yaml ] || { echo "::error::no rendered registry to publish (the render step did not run)"; exit 1; }
+          cp tpkg-registry.yaml "$RUNNER_TEMP/registry.yaml"
+          git config user.name "tebako-ci"
+          git config user.email "tebako@ribose.com"
+          git fetch origin main
+          # main can move the registry mid-publish (a mirror PR landing
+          # while the matrix builds): the in-tree render would abort the
+          # branch checkout below. The temp copy is the payload — discard
+          # the dirty tree before branching, restore after (the ruby
+          # coordinator's fix, mirrored).
+          git checkout -- tpkg-registry.yaml
+          branch="publish/v${TEBAKO_VERSION}-registry"
+          git checkout -b "$branch" origin/main
+          cp "$RUNNER_TEMP/registry.yaml" tpkg-registry.yaml
+          if git diff --quiet origin/main -- tpkg-registry.yaml; then
+            echo "registry unchanged (or the entries already landed on main)"
+            exit 0
+          fi
+          git add tpkg-registry.yaml
+          git commit -m "publish v${TEBAKO_VERSION}: registry entries"
+          # force-with-lease on the bot branch: a re-publish re-creates it.
+          # The checkout is shallow, so the lease has no expectation for a
+          # branch a DIED run left behind — fetch it first or the push is
+          # rejected and the mirror never lands. With the tracking ref in
+          # place the lease still refuses a concurrent FOREIGN push, as
+          # designed.
+          git fetch origin "+refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null || true
+          git push --force-with-lease origin "$branch"
+          # tebako#1050: re-dispatch safety (the ruby coordinator's shape,
+          # mirrored). The probe is state-filtered and a probe failure is a
+          # named error — a swallowed transport error (a 502 in the lookup)
+          # must never read as "no PR", or the create dies on
+          # already-exists and a re-dispatch fails deterministically
+          # (the python factory's v0.3.5 publish, run 43370376600 attempt 2).
+          probe() { gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty'; }
+          if ! number="$(probe)"; then
+            echo "::error::could not query the open PRs for $branch — refusing to guess (a wrong guess duplicates the PR or strands the render)"
+            exit 1
+          fi
+          if [ -z "$number" ]; then
+            body="$RUNNER_TEMP/registry-pr-body.md"
+            cat > "$body" <<EOF
+          Automated registry entries for v${TEBAKO_VERSION} — rendered from the
+          release's per-package .manifest.json shards by tools/registry_update.rb
+          (spec 13 §2a's release job; spec 04 §2's mirror). main is protected,
+          so the registry lands by PR.
+          EOF
+            if ! create_out="$(gh pr create --base main --head "$branch" \
+                                --title "publish v${TEBAKO_VERSION}: registry entries" \
+                                --body-file "$body" 2>&1)"; then
+              case "$create_out" in
+                *"already exists"*)
+                  # The probe→create race (a concurrent attempt opened the
+                  # PR between the two): the push above already delivered
+                  # the render to the branch the PR tracks.
+                  echo "$create_out"
+                  ;;
+                *)
+                  echo "$create_out" >&2
+                  exit 1
+                  ;;
+              esac
+            fi
+            number="$(probe)" || true
+            [ -n "${number:-}" ] || { echo "::error::$branch: the PR was created but could not be re-resolved"; exit 1; }
+          else
+            echo "registry PR #$number already open for $branch (a re-dispatch) — the force-push healed the head; reusing it"
+          fi
+          gh pr merge --auto --squash "$branch" || gh pr merge --squash "$branch"
+
+      # Immediacy, not correctness (tebako-packages/registry#5). The
+      # official aggregate polls every six hours, so a publish stays
+      # invisible to `tebako install` until the next tick. Fired only AFTER
+      # the registry PR is merged (the aggregate reads this feedstock's
+      # registry at its default branch); an undeliverable dispatch warns and
+      # leaves the cron as the floor.
+      - name: Nudge the official registry's aggregate
+        if: ${{ always() && !cancelled() && !inputs.audit }}
+        env:
+          GH_TOKEN: ${{ secrets.TEBAKO_CI_PAT_TOKEN }}
+          # The render/publish steps declare this; the nudge died on it
+          # (the python factory's v0.3.4 registry_only run 42757685803:
+          # "TEBAKO_VERSION: unbound variable" under set -u). Same
+          # expression, same source.
+          TEBAKO_VERSION: ${{ inputs.registry_only && inputs.registry_version || (needs.linux-gnu.outputs.tebako_version || needs.linux-musl.outputs.tebako_version || needs.macos.outputs.tebako_version) }}
+        run: |
+          set -uo pipefail
+          branch="publish/v${TEBAKO_VERSION}-registry"
+          merged=""
+          for _ in $(seq 1 30); do
+            merged=$(gh pr list --head "$branch" --state merged --json number --jq '.[0].number // empty' 2>/dev/null || true)
+            [ -n "$merged" ] && break
+            sleep 10
+          done
+          if [ -z "$merged" ]; then
+            echo "::warning::the registry row is not on main yet — the six-hourly tick catches it"
+            exit 0
+          fi
+          gh api repos/tebako-packages/registry/dispatches \
+            -f event_type=feedstock-published \
+            -f client_payload[feedstock]="${{ github.repository }}" \
+            -f client_payload[tag]="${{ github.ref_name }}" \
+            || echo "::warning::the aggregate dispatch failed — the six-hourly tick still catches it"
+
+      - name: Ping the versions catalog
+        if: ${{ always() && success() }}
+        continue-on-error: true
+        # Refreshes www.tebako.org/versions within minutes of a publish
+        # (versions plan 05; the daily cron stays the backstop). The org
+        # TEBAKO_CI_PAT_TOKEN must carry actions:write on
+        # tamatebako/versions for the dispatch — until proven, a failed
+        # ping never blocks a release.
+        run: gh api repos/tamatebako/versions/dispatches -f event_type=runtime-published
+        env:
+          GH_TOKEN: ${{ secrets.TEBAKO_CI_PAT_TOKEN || secrets.GITHUB_TOKEN }}

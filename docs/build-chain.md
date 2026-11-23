@@ -2,19 +2,19 @@
 
 This document is the normative description of how this repository's CI
 turns a pristine CRAN source tarball into a verified runtime pair, and
-of the pin contracts that keep the skeleton honest. **If you change any
+of the pin contracts that keep the factory honest. **If you change any
 workflow, the build tooling, the matrix computation, or a cache key,
 update this file in the same PR.** A future agent that skips this file
 and "just fixes" a red run is the classic failure mode — read it first.
 (tebako-runtime-php's docs/build-chain.md is the family reference; this
-file carries the R skeleton's subset.)
+file carries the R factory's edition, minus the windows legs.)
 
 ## The staged hierarchy
 
 One reusable workflow, `_build-platform.yml` (the php factory's port),
-called by the thin trigger `build-linux-gnu.yml`. The skeleton ships
-FOUR stages — no publish/sign jobs (that increment is named in the
-README):
+called by the three thin triggers (`build-linux-gnu.yml`,
+`build-linux-musl.yml`, `build-macos.yml`) and by the `publish.yml`
+coordinator — never dispatched directly:
 
 1. **parity** — the contract gate's driver-source parity arm needs the
    pinned link-unit release's `lib.rs` off raw.githubusercontent.com, a
@@ -38,17 +38,44 @@ README):
    before any leg spends compute; the build leg then pulls
    `name:tag@digest`. A retagged toolchain container fails the preflight
    by name instead of moving the compiler under the matrix, and a failed
-   preflight skips the build legs outright.
-4. **build** — one leg per (R × arch): `tools/build_runtime` →
+   preflight skips the build legs outright. (The macOS legs are
+   runner-native — no container, nothing to preflight.)
+4. **build** — one leg per (R × arch): `tools/build_runtime` → (macOS:
+   the sign+notarize arm, spec 31, gated on `APPLE_SIGNING_ENABLED`) →
    `ci/check_symbol_provenance.sh` → `tools/boot_smoke` → the
    `runtime-packages-<os>-<arch>-<r>` artifact. The linux legs
    docker-run the digest-pinned `tpkg-builder` image per step (the
    container grammar: the job-level `container:` form is out — the
    alpine-based musl image cannot host node actions, and uniformity
-   beats a per-image branch).
-5. **verify** — the terminal aggregate and the branch-protection gate.
+   beats a per-image branch). The macOS legs run runner-native: the
+   toolchain is the runner image's CLT plus its Homebrew gfortran
+   (the macOS provisioning note below), and the provenance gate's
+   Mach-O arm proves the closure stays system-only.
+5. **publish** — one leg per (R × arch), re-running THIS leg's artifact
+   handoff (tebako-runtime-ruby#190's split): the leg that built a
+   package publishes it (the tebako-release gem's uploader — payload +
+   .sha256 sidecars + the .manifest.json shard, write-once per-leg
+   names) and signs its served names (the gem's signer, spec 09 §5),
+   then attests SLSA L3 provenance over the exact shipped bytes. N legs
+   publish concurrently with zero rendezvous (spec 13 §2a's
+   de-rendezvous); a publish-layer failure re-runs as a minutes-long
+   download + upload, never a rebuild. Runs only when the caller asked
+   for `publish`.
+6. **verify** — the terminal aggregate and the branch-protection gate.
    The build legs are a dynamic matrix whose check names shift with the
-   catalog, so protection pins this job's stable check name.
+   catalog, so protection pins this job's stable check name; on publish
+   runs it gates on the publish legs too.
+
+`publish.yml` is the operator-facing coordinator (the php factory's
+port): the optional `prepare-release` job (a force_rebuild republication
+recreates the release OBJECT under the kept tag —
+tebako-runtime-ruby#189), one `_build-platform.yml` call per selected
+platform, then ONE release job that audits the whole matrix against the
+release (read-only — the legs' publish jobs already landed their
+packages), renders the registry from the release's shards
+(`tools/registry_update.rb`), and lands it on main by bot PR +
+auto-merge (main is protected), then nudges the official aggregate and
+pings the versions catalog.
 
 `lint.yml` is the static gate (no builds): the same contract check, the
 catalog/matrix resolution, a `ruby -c` sweep over every authored ruby
@@ -76,37 +103,77 @@ Both download under `.build/downloads/` and are re-verified against the
 pins on every use, so a poisoned or stale cache entry cannot survive a
 pin bump.
 
-## The toolchain container and the in-leg provisioning
+## The toolchain containers and the in-leg provisioning
 
-The linux leg runs inside `ghcr.io/tamatebako/tpkg-builder-
-x86_64-linux-gnu` (ubuntu 20.04, gcc-11). The v1 image lacks three
-packages R 4.6 needs:
+The linux legs run inside the digest-pinned `tpkg-builder` images; the
+macOS legs are runner-native. Each leg's provisioning:
 
-- **gfortran** — R's included LAPACK is Fortran; there is no C
-  fallback. The leg installs `gfortran-11` and points
-  `update-alternatives` at it (matching the image's gcc-11).
-  gfortran-11 comes from the `ubuntu-toolchain-r/test` PPA, and
-  `ppa.launchpad.net` intermittently 503s mid-fetch (index and pool
-  alike) — the apt phase repoints the source at
-  `ppa.launchpadcontent.net` (same content, steady) and retries the
-  update/install a handful of times before failing named.
-- **liblzma-dev** and **libpcre2-dev** — R 4.6 dropped its bundled xz
-  and pcre2; configure requires the system libraries (statically
-  linked via the `-L` pin below).
+- **linux-gnu** (`tpkg-builder-x86_64-linux-gnu`, ubuntu 20.04,
+  gcc-11). The v1 image lacks three packages R 4.6 needs:
+  - **gfortran** — R's included LAPACK is Fortran; there is no C
+    fallback. The leg installs `gfortran-11` and points
+    `update-alternatives` at it (matching the image's gcc-11).
+    gfortran-11 comes from the `ubuntu-toolchain-r/test` PPA, and
+    `ppa.launchpad.net` intermittently 503s mid-fetch (index and pool
+    alike) — the apt phase repoints the source at
+    `ppa.launchpadcontent.net` (same content, steady) and retries the
+    update/install a handful of times before failing named.
+  - **liblzma-dev** and **libpcre2-dev** — R 4.6 dropped its bundled xz
+    and pcre2; configure requires the system libraries (statically
+    linked via the `-L` pin below).
+- **linux-musl** (`tpkg-builder-x86_64-linux-musl` /
+  `tpkg-builder-aarch64-linux-musl`, alpine): `apk add gfortran
+  bzip2-dev bzip2-static xz-dev xz-static pcre2-dev tzdata` (bounded
+  retry on a mirror hiccup). tzdata is for R's configure, which runs a
+  date-time conversion probe needing the zone database. Alpine splits
+  the static archives out of the -dev
+  packages: `bzip2-static`/`xz-static` carry libbz2.a/liblzma.a (the
+  -dev packages carry the headers and the shared objects only), while
+  pcre2-dev ships libpcre2-8.a directly. The gfortran/quadmath story
+  forks per arch: aarch64 alpine builds gfortran WITHOUT libquadmath
+  (container-proven: `gfortran -print-file-name=libquadmath.a` finds
+  nothing), so its libgfortran.a folds the quadmath entry points
+  internally and the musl-arm64 `FLIBS` pin drops `-lquadmath`;
+  x86_64 alpine SHIPS libquadmath.a and its libgfortran.a references
+  `quadmath_snprintf` exactly like gnu's, so the musl-x86_64 pin keeps
+  `-lquadmath` (RBuild's `quadmath_static?`).
+- **macos** (`macos-15-intel`, `macos-15`): runner-native, no
+  container. The toolchain is the runner image's Command Line Tools
+  (Apple clang) plus the image's Homebrew **gcc** formula — gfortran
+  and its static archives (`libgfortran.a`, `libquadmath.a`,
+  `libgcc.a`) come from there, located through `gfortran
+  -print-file-name`, never a hardcoded Cellar path. The
+  `MACOSX_DEPLOYMENT_TARGET` floor is contract.yml's
+  `macos_deployment_target` pin, exported over the WHOLE build
+  (configure probes, the deps stage, the final link) — unpinned, the
+  exe's LC_BUILD_VERSION minos floats with the build host's OS
+  (tebako-runtime-python#81), and the provenance gate's Mach-O arm
+  asserts recorded == pin. The sign+notarize arm
+  (`ci/macos-sign-notarize-runtime.sh`, spec 31: Developer ID
+  Application + hardened runtime + notary ticket, entitlements
+  disable-library-validation + allow-jit) runs in-leg after the build,
+  gated on `APPLE_SIGNING_ENABLED` — every downstream gate and the
+  publish stage's .sha256 anchor the exact SIGNED bytes.
 
-No **libssl-dev** and no **zlib1g-dev** reliance, deliberately: the
-deps stage builds its own static OpenSSL 3 (the `CURL_CONFIG` pin
-below) — the focal image's 1.1.1 is EOL and curl 8.23 rejects it
-outright (configure requires >= 3.0.0) — and its own -fPIC static zlib
-(the `build_zlib` stage): the image's `libz.a` is compiled without PIC,
+No **libssl-dev** and no **zlib1g-dev** reliance on the linux legs,
+deliberately: the deps stage builds its own static OpenSSL 3 (the
+`CURL_CONFIG` pin below) — the focal image's 1.1.1 is EOL and curl
+8.23 rejects it outright (configure requires >= 3.0.0), and a bare
+musl target has no libssl at all — and its own -fPIC static zlib (the
+`build_zlib` stage): the gnu image's `libz.a` is compiled without PIC,
 and R links `-lz` into internet.so, a shared object, where ld rejects
-non-PIC relocations outright.
+non-PIC relocations outright. The macOS legs build NO curl/openssl/
+zlib at all: macOS's own dylibs carry them (the system curl-config
+answers `--built-shared yes`; the closure stays system-only by policy
+— the Mach-O provenance arm proves it), and the deps stage there
+builds only pcre2 and xz (static, -fPIC) because the SDK ships their
+stubs without the headers.
 
-The named follow-up is baking the three into tebako-ci-containers and
-dropping the in-leg `apt-get` — the container pin's immutable digest
-means the provisioning is itself deterministic (the same base image
-every time), but an image that carries its own toolchain is the
-honest end state.
+The named follow-up is baking the linux packages into
+tebako-ci-containers and dropping the in-leg `apt-get`/`apk` — the
+container pin's immutable digest means the provisioning is itself
+deterministic (the same base image every time), but an image that
+carries its own toolchain is the honest end state.
 
 ## The Makefile-substitution law (the factory never edits R source)
 
@@ -130,6 +197,10 @@ patch:
   comment;
 - the `EXTRA_LIBS` line's `$(BLAS_LIBS)` becomes
   `$(BLAS_STATIC_OBJS)` — R.bin links R's own included BLAS as OBJECTS.
+  `CONFIGURE_ARGS` carries `--without-blas` for this: the included BLAS
+  is the uniform answer on every leg (darwin's configure default would
+  otherwise find the system Accelerate framework and the closure would
+  fork per leg — the same determinism rule as the zlib/OpenSSL deps).
   Upstream builds that BLAS ONLY as the shared `libRblas.so`
   (src/extra/blas/Makefile.in builds nothing when BLAS_SHLIB is false),
   and an exe that NEEDs it could never boot the driver: ld.so resolves
@@ -293,6 +364,55 @@ specific "the build host decided the artifact" failure class:
   whenever a build host happens to have them (zstd has no opt-out at
   all). Pinned off for the same deterministic-closure rule; lazy-load
   databases stay gzip/xz/bzip2.
+
+The **darwin legs** carry the same law in ld64 grammar
+(`darwin_configure_env`):
+
+- **deps tier** — only pcre2 and xz are factory-built (static, -fPIC):
+  the SDK ships their stubs without the headers, so the deps stage
+  provides both honestly. libz/libbz2/libcurl link DYNAMICALLY against
+  macOS's own dylibs by policy (a bare macOS always carries them; the
+  Mach-O provenance arm proves the closure stays system-only).
+- **`CPPFLAGS=-I<deps>/include`** and
+  **`PKG_CONFIG_PATH=<deps>/lib/pkgconfig`** — pcre2.h/lzma.h live
+  nowhere else, and R's pkg-config probes must find the deps stage's
+  `.pc` files and nothing else (a runner's Homebrew pcre2 would
+  otherwise leak into the closure — the tebako-runtime-python#80
+  class).
+- **`CURL_CONFIG=/usr/bin/curl-config`** — macOS's own libcurl: the
+  system curl-config answers `--built-shared yes`, so R consumes
+  `--libs` (-lcurl, dynamic) and the deps stage builds no
+  curl/openssl/zlib on this leg at all.
+- **`FLIBS`** — clang's spelling of the exe-side static gfortran chain:
+  `-Wl,-u,__gfortran_concat_string -lgfortran -lquadmath -lgcc -lm`,
+  resolved against the `-L<static-libs>` pin (the compiler's archives,
+  symlinked there). `-lgcc` closes it: libgfortran's quadmath IO
+  references GCC's 128-bit soft-float routines (__divtf3/__multf3/
+  __eqtf2…), which Apple's compiler-rt omits on arm64 (darwin long
+  double is 64-bit) — without libgcc.a the mixed C/Fortran configure
+  probe dies. `FLIBS_IN_SO=-lm` drops the chain: darwin's shlib AND
+  dylib links both carry `-undefined dynamic_lookup`, so every shared
+  object's gfortran references defer to load time and bind from the
+  exe (ld64 needs no --export-dynamic — an exe's globals are visible to
+  dlopen'd bundles by default; the provenance gate asserts
+  `_gfortran_concat_string` is defined).
+- **`SHLIB_LDFLAGS`/`DYLIB_LDFLAGS`** — the $ORIGIN pin's darwin
+  spellings (`@loader_path/../lib` + `@loader_path/../../../lib` for
+  the modules and package .so's; `@loader_path/.` for lib/R/lib's own
+  dylibs), covering both shlib depths exactly as on linux.
+- **the @rpath install-name fixup** (`fixup_darwin_install_names`,
+  after `make install`): dyld consults LC_RPATH ONLY for dependent
+  names spelled `@rpath/<name>` — R hardcodes BARE `-install_name
+  libRlapack.dylib`/`libRblas.dylib` grammar, which dyld resolves
+  against the cwd and its fallback dirs, never the rpath pins. The
+  fixup rewrites the two dylibs' LC_ID_DYLIB to `@rpath/<name>` and
+  every referencing object (libRlapack → libRblas; lapack.so, the
+  library package .so's → both) with install_name_tool — the idiom
+  upstream's own packaging uses (R links every target with
+  `-headerpad_max_install_names` for exactly this), and the rewrite the
+  exec_closure walk's @rpath arm materializes. The provenance gate's
+  arm 7 re-proves lapack.so's direct `@rpath/libRblas.dylib` row; the
+  boot smoke proves the dlopen end to end.
 
 ## The env image (what ships, what is pruned)
 
