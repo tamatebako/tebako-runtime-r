@@ -139,10 +139,11 @@ macOS legs are runner-native. Each leg's provisioning:
   `-lquadmath` (RBuild's `quadmath_static?`).
 - **macos** (`macos-15-intel`, `macos-15`): runner-native, no
   container. The toolchain is the runner image's Command Line Tools
-  (Apple clang) plus the image's Homebrew **gcc** formula — gfortran
-  and its static archives (`libgfortran.a`, `libquadmath.a`,
-  `libgcc.a`) come from there, located through `gfortran
-  -print-file-name`, never a hardcoded Cellar path. The
+  (Apple clang) plus Homebrew's **gcc** formula — the image carries no
+  gcc by default, so the leg installs it in-leg (`brew install gcc`,
+  bounded retry); gfortran and its static archives (`libgfortran.a`,
+  `libquadmath.a`, `libgcc.a`) come from there, located through
+  `gfortran -print-file-name`, never a hardcoded Cellar path. The
   `MACOSX_DEPLOYMENT_TARGET` floor is contract.yml's
   `macos_deployment_target` pin, exported over the WHOLE build
   (configure probes, the deps stage, the final link) — unpinned, the

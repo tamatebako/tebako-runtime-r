@@ -78,11 +78,11 @@ container_version: "v1"
 #     "https://ghcr.io/v2/tamatebako/tpkg-builder-<triplet>/manifests/<tag>" | grep -i docker-content-digest
 container_digests:
   tpkg-builder-x86_64-linux-gnu:
-    amd64: "sha256:6ab7d71bcae6b93bcba4e5201835d7135ee99b29f72755d7f4bb8f48b398ae90"
+    amd64: "sha256:76d9822a4cdeb63d1b4081161c76a511ac50ecf40efd7c9820fe18c07225193d"
   tpkg-builder-x86_64-linux-musl:
-    amd64: "sha256:e933e07cc7320b53fd558a3ede20728530bb0b1fbcf8100efc55f5ac80b97e2d"
+    amd64: "sha256:92b952976a36c7ef6cde9a0609549e0dbb3ef304cd79bf4caef3c19f9cb1b185"
   tpkg-builder-aarch64-linux-musl:
-    arm64: "sha256:f3686d19035400fc87310fc2d38842ed24d3cf56bc95611a2b9000bfcbdf4ccf"
+    arm64: "sha256:a3461eb41f5f9f6eeb79536da92ac0d4de09c14703bbb9290789418f7bc0cffb"
 
 # The published link-unit pin: the tamatebako/tebako release whose
 # prebuilt link unit (the spec-17 driver + scoped tfs + the native
