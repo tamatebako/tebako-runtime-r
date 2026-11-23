@@ -85,6 +85,11 @@ packages R 4.6 needs:
 - **gfortran** — R's included LAPACK is Fortran; there is no C
   fallback. The leg installs `gfortran-11` and points
   `update-alternatives` at it (matching the image's gcc-11).
+  gfortran-11 comes from the `ubuntu-toolchain-r/test` PPA, and
+  `ppa.launchpad.net` intermittently 503s mid-fetch (index and pool
+  alike) — the apt phase repoints the source at
+  `ppa.launchpadcontent.net` (same content, steady) and retries the
+  update/install a handful of times before failing named.
 - **liblzma-dev** and **libpcre2-dev** — R 4.6 dropped its bundled xz
   and pcre2; configure requires the system libraries (statically
   linked via the `-L` pin below).
