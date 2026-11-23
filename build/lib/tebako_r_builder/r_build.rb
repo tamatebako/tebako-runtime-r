@@ -1054,6 +1054,11 @@ module TebakoRBuilder
       else
         `gcc -print-file-name=#{archive}`.strip
       end
+    rescue Errno::ENOENT
+      # The compiler binary itself is missing (a macos runner before the
+      # in-leg brew provisioning, say) — the named error, never a bare
+      # Errno::ENOENT trace.
+      raise TebakoRBuilder::Error.new("the compiler needed to locate #{archive} is not on PATH — #{static_archive_hint(archive)}", 103)
     end
 
     # The provisioning hint for a missing static archive

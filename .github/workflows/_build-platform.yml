@@ -447,6 +447,21 @@ jobs:
               uid=$(stat -c %u /mnt/w/contract.yml); gid=$(stat -c %g /mnt/w/contract.yml)
               chown -R "$uid:$gid" /mnt/w/.build /mnt/w/runtime-packages 2>/dev/null || true'
 
+      # The macos legs provision the Fortran toolchain runner-native:
+      # the runner image's Homebrew carries no gcc formula by default,
+      # and R's internal LAPACK is Fortran — the exe carries
+      # libgfortran/libquadmath/libgcc statically (r_build.rb's
+      # STATIC_ARCHIVES_DARWIN, located via gfortran -print-file-name).
+      # docs/build-chain.md's in-leg provisioning note.
+      - name: Provision the Fortran toolchain (macos)
+        if: matrix.os == 'macos'
+        run: |
+          set -e
+          for i in 1 2 3; do
+            brew install gcc && break || { [ "$i" -lt 3 ] && sleep 20; }
+          done
+          gfortran --version | head -1
+
       - name: Build the runtime (macos)
         if: matrix.os == 'macos'
         run: tools/build_runtime --r "${{ matrix.r }}"
