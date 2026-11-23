@@ -1,0 +1,10 @@
+{
+  "env": [
+    {
+      "host": "ubuntu-22.04",
+      "container": "ghcr.io/tamatebako/tpkg-builder-x86_64-linux-gnu",
+      "os": "linux-gnu",
+      "arch": "x86_64"
+    }
+  ]
+}

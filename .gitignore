@@ -1,0 +1,8 @@
+# Build artifacts
+.build/
+runtime-packages/
+
+# Ruby tooling (factory convention: the lockfile floats)
+Gemfile.lock
+.rspec_status
+coverage/

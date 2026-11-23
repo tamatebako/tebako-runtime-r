@@ -1,0 +1,77 @@
+# Copyright (c) 2026 [Ribose Inc](https://www.ribose.com).
+# All rights reserved.
+# This file is a part of tamatebako
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+# Supported upstream R versions. There is NO tamatebako source factory
+# for R yet (the census increment builds from pristine upstream): the
+# legs download CRAN's published release tarballs directly, so THIS file
+# is the source-pin trust anchor — the sha256 recorded beside each url,
+# verified at fetch time (a mismatch is a hard error, never a refetch).
+# The grammar mirrors tamatebako/ruby's versions.yml (the source-factory
+# shape this factory will flow from if a tamatebako/R source factory ever
+# opens).
+#
+# contract.yml's r.catalog selects which of these pinned versions the
+# matrix builds; scripts/check_contract.rb locks the two (a catalog
+# version with no pin, or a pin the catalog never builds, is a config
+# bug).
+---
+versions:
+  "4.6.2":
+    url: https://cran.r-project.org/src/base/R-4/R-4.6.2.tar.gz
+    sha256: c297040f6392b1dac6e5c0eb398422cfdaedf540ae2205edb9ad0d10cb10ee00
+    line: "4.6"
+
+# The factory-built dependency pins (the deps stage, docs/build-chain.md):
+# upstream sources this factory builds ITSELF because no honest artifact
+# can consume the distro's. R 4.6 requires libcurl with https support
+# (configure hard-fails without it — there is no --without-libcurl), and
+# the distro libcurl drags an LGPL/GPL-encumbered dynamic closure
+# (libidn2/librtmp/libssh/...) a bare system neither carries nor the
+# license allows statically. So the factory builds a MINIMAL static
+# libcurl (http/https/ftp only, nothing else) and R's configure consumes
+# its curl-config. curl 8.23 in turn requires OpenSSL >= 3.0, and the
+# focal toolchain image carries only the EOL OpenSSL 1.1.1 — so the deps
+# stage also builds OpenSSL 3.5 (the LTS line, Apache-2.0: license-clean
+# for static linking, unlike the LGPL TLS stacks) static, providers
+# built in (no runtime dlopen — a module build would look for its
+# providers on the BUILD machine's paths).
+# zlib joins them for a different reason: R links -lz into internet.so,
+# a SHARED object, and the focal toolchain's static libz.a is compiled
+# without -fPIC (ld rejects its relocations in a shared link) — so the
+# deps stage builds zlib itself, -fPIC throughout, and the -L pin
+# resolves every -lz (libR's too) against it.
+# Same trust-anchor grammar as the versions above: the sha256 is pinned
+# beside the url and verified at fetch time (a mismatch is a hard
+# error).
+deps:
+  zlib:
+    url: https://github.com/madler/zlib/releases/download/v1.4/zlib-1.4.tar.gz
+    sha256: 02dd159783677a749c04adbdd02b55b8a2bcc7e054f51b76b549199a916ad584
+  openssl:
+    url: https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz
+    sha256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+  curl:
+    url: https://curl.se/download/curl-8.23.0.tar.gz
+    sha256: e3de77cfa6367083c776a26647fc9f633b538c06c3baa73d931a252ac8f72b49
