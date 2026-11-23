@@ -429,8 +429,9 @@ jobs:
                   ok=0
                   for i in 1 2 3; do
                     # bzip2-dev/xz-dev carry the headers; the STATIC
-                    # archives ride alpine's -static split packages
-                    # (pcre2-dev ships libpcre2-8.a directly).
+                    # archives ride the -static split packages alpine
+                    # separates out (pcre2-dev ships libpcre2-8.a
+                    # directly).
                     if apk add --no-cache gfortran bzip2-dev bzip2-static xz-dev xz-static pcre2-dev tzdata > /tmp/apk.log 2>&1; then
                       ok=1; break
                     fi
