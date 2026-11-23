@@ -1,0 +1,115 @@
+# Copyright (c) 2026 [Ribose Inc](https://www.ribose.com).
+# All rights reserved.
+# This file is a part of tamatebako
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+# Bootstrap <-> runtime contract version: the versioned protocol between
+# the tebako bootstrap (released from tamatebako/tebako) and the runtime
+# images published from this repo — the env vars passed down, the argv
+# layout, and the filesystem-image handoff. Modeled on
+# tebako-runtime-php's contract.yml (itself tebako-runtime-python's); the
+# version -> semantics changelog table is spec 06's, the contract-2
+# grammar is spec 17's.
+#
+# This factory has NO contract-1 era: R runtimes exist only in the image
+# era, so contract_version is 2 from the first build (the schema floors
+# it at 2 — contract 1 was the retired v1 C++ tebako-main.cpp grammar
+# this factory never ships). Bump rules mirror the other factories': any
+# change to env/argv/handoff semantics bumps the integer by exactly +1,
+# here and in the consumed driver's compiled-in TEBAKO_CONTRACT_VERSION,
+# in the same commit — scripts/check_contract.rb locks the two (the
+# driver-source parity arm reads the pinned link_unit_release's
+# crates/tebako-driver/src/lib.rs).
+#
+# Schema: schema/contract.schema.yml (validated by the same check).
+---
+contract_version: 2
+
+# The toolchain CONTAINER line the POSIX legs run inside:
+# ghcr.io/tamatebako/tpkg-builder-<triplet>:<container_version>, baked by
+# tebako-ci-containers. This factory never references the archived v1
+# tebako-<platform> images. "v1" is the moving family tag; the immutable
+# side is container_digests below.
+#
+# NOTE (the skeleton's named toolchain follow-up): the v1 gnu image lacks
+# three packages the R build needs — gfortran (R's internal LAPACK is
+# Fortran), and liblzma-dev and libpcre2-dev (R 4.6 dropped its bundled
+# xz and pcre2). The legs provision them in-container (apt-get, pinned
+# by the digest below) until tebako-ci-containers bakes them — see
+# docs/build-chain.md and .github/workflows/_build-platform.yml. (The
+# deps stage's TLS and zlib need NO distro -dev packages either: it
+# builds its own static OpenSSL 3 — the focal image's 1.1.1 is EOL and
+# too old for curl 8.23 — and its own -fPIC static zlib, because the
+# image's libz.a carries no PIC and internet.so links -lz into a shared
+# object.)
+container_version: "v1"
+
+# The immutable side of the container line (the ruby#381 idiom, born
+# pinned here): the ghcr manifest digest per (container x arch), recorded
+# at pin time. ghcr tags are MUTABLE, so container_version alone never
+# pins the toolchain — the preflight job proves recorded == live (the
+# registry's Docker-Content-Digest header) before any leg spends compute,
+# and the container legs pull name:tag@digest. A deliberate toolchain
+# bump edits the tag above AND the digests here in the same commit. Read
+# the live digest with ghcr's anonymous-token flow:
+#   token=$(curl -fsSL "https://ghcr.io/token?scope=repository:tamatebako/tpkg-builder-<triplet>:pull" | jq -r .token)
+#   curl -fsSL -o /dev/null -D - -H "Authorization: Bearer $token" \
+#     -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
+#     "https://ghcr.io/v2/tamatebako/tpkg-builder-<triplet>/manifests/<tag>" | grep -i docker-content-digest
+container_digests:
+  tpkg-builder-x86_64-linux-gnu:
+    amd64: "sha256:6ab7d71bcae6b93bcba4e5201835d7135ee99b29f72755d7f4bb8f48b398ae90"
+
+# The published link-unit pin: the tamatebako/tebako release whose
+# prebuilt link unit (the spec-17 driver + scoped tfs + the native
+# closure, per triplet) the legs CONSUME as a download instead of
+# building from source, and whose tfs CLI packs the env image. The
+# closure depends on the triplet and the product release only — never on
+# the R version. An empty pin, a missing asset, or a checksum MISMATCH
+# are all hard named errors — never a silent fallback (this factory has
+# no source-build path for the driver stack; a supply-chain event is
+# reported, not worked around).
+#
+# v2.8.66 is tebako-runtime-php's current pin (verified 2026-11-23: the
+# release ships link-unit-<ver>-linux-gnu-x86_64.tar.gz): the v2.8 driver
+# line plus the raw-syscall interposition pair (tebako#935/#937) —
+# v2.8.66's forward is the syscall INSTRUCTION itself (no libc symbol, no
+# allocation, no loader lock), the fix whose absence wedged the gnu legs
+# at first intercepted call. Contract unchanged (2).
+link_unit_release: "v2.8.66"
+
+# The R version catalog this factory builds (and will publish, once the
+# publish increment lands). The SOURCE PINS (url/sha256 per version) live
+# in versions.yml — there is no tamatebako source factory for R yet, so
+# this factory fetches CRAN's release tarballs directly; check_contract
+# locks catalog <=> versions.yml (a version in one but not the other is a
+# config bug).
+#
+# Set grammar (tebako-runtime-ruby's semantics, via the php factory):
+#   catalog — every version this factory builds
+#   full    — the tip of every supported line
+#   tidy    — the primary smoke set
+r:
+  catalog: ["4.6.2"]
+  full: ["4.6.2"]
+  tidy: ["4.6.2"]

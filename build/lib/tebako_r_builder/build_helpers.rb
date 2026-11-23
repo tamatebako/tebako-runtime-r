@@ -1,0 +1,213 @@
+# frozen_string_literal: true
+
+# Copyright (c) 2026 [Ribose Inc](https://www.ribose.com).
+# All rights reserved.
+# This file is a part of tamatebako
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+require "digest"
+require "fileutils"
+require "json"
+require "net/http"
+require "open3"
+require "uri"
+
+module TebakoRBuilder
+  # Build helpers (tebako-runtime-php's BuildHelpers, carried over
+  # unchanged but for the module name): the command runner and the shared
+  # download core every fetcher uses — SourceFetcher, LinkUnit, TfsTool —
+  # so the Net::HTTP discipline (redirect bound, timeouts, bounded retry,
+  # named failures) exists exactly once.
+  module BuildHelpers
+    MAX_REDIRECTS = 5
+
+    # A fetch's transient-failure budget: bounded attempts with backoff
+    # (the delay is BACKOFF_BASE**attempt seconds) for the failures a
+    # retry can honestly fix — 408/429/5xx responses and transport-level
+    # errors. Every other 4xx is permanent and fails closed on the first
+    # attempt. Each failed attempt is named on stderr as it happens, so
+    # the raw log carries the cause even when a later annotation channel
+    # drops it.
+    READ_URL_ATTEMPTS = 3
+    READ_URL_BACKOFF_BASE = 2
+    READ_URL_RETRYABLE_STATUSES = [408, 429].freeze
+    READ_URL_RETRYABLE_ERRORS = [
+      EOFError, Net::HTTPBadResponse, OpenSSL::SSL::SSLError, SocketError,
+      SystemCallError, Timeout::Error
+    ].freeze
+
+    class << self
+      def run_with_capture(args, env: {}, chdir: nil)
+        args = args.compact
+        puts "   ... @ #{args.join(" ")}"
+        spawn_opts = chdir ? { chdir: chdir } : {}
+        out, st = Open3.capture2e(env, *args, **spawn_opts)
+        if st.signaled? || !st.exitstatus.zero?
+          raise TebakoRBuilder::Error, "Failed to run #{args.join(" ")} (#{st}):\n #{out}"
+        end
+
+        out
+      end
+
+      def run_with_capture_v(args, env: {}, chdir: nil)
+        if verbose?
+          args_v = args.dup
+          args_v.push("--verbose")
+          puts run_with_capture(args_v, env: env, chdir: chdir)
+        else
+          run_with_capture(args, env: env, chdir: chdir)
+        end
+      end
+
+      # Sets up temporary environment variables and yields to the
+      # block. When the block exits, the environment variables are set
+      # back to their original values.
+      def with_env(hash)
+        old = {}
+        hash.each do |k, v|
+          old[k] = ENV.fetch(k, nil)
+          ENV[k] = v
+        end
+        begin
+          yield
+        ensure
+          hash.each_key { |k| ENV[k] = old[k] }
+        end
+      end
+
+      def verbose?
+        %w[yes true].include?(ENV.fetch("VERBOSE", nil))
+      end
+
+      def sha256_file(path)
+        Digest::SHA256.file(path).hexdigest
+      end
+
+      # Download url to dest (creating the parent dir); a failure deletes
+      # the partial file and raises with the caller's exit code.
+      def download(url, dest, code:)
+        FileUtils.mkdir_p(File.dirname(dest))
+        File.binwrite(dest, read_url(url, code: code))
+        dest
+      rescue TebakoRBuilder::Error
+        FileUtils.rm_f(dest)
+        raise
+      end
+
+      # `retry_extra_statuses` names 4xx codes THIS caller treats as
+      # transient (the GitHub release API answers 404 under load and for a
+      # token that cannot see the repository at that instant). The default
+      # stays empty: a missing asset must fail closed on the first attempt.
+      def read_url(url, code:, redirects_left: MAX_REDIRECTS, headers: {}, retry_extra_statuses: []) # rubocop:disable Metrics/MethodLength
+        uri = URI.parse(url)
+        return read_file_url(uri, code) if uri.scheme == "file"
+        if redirects_left.zero?
+          raise TebakoRBuilder::Error.new("too many redirects fetching #{url}", code)
+        end
+
+        READ_URL_ATTEMPTS.times do |attempt|
+          begin
+            response = http_get(uri, headers)
+          rescue *READ_URL_RETRYABLE_ERRORS => e
+            next if retry_attempt(url, attempt + 1, "#{e.class}: #{e.message}")
+
+            raise TebakoRBuilder::Error.new("#{e.class}: #{e.message} fetching #{url}", code)
+          end
+          case response
+          when Net::HTTPSuccess then return response.body
+          when Net::HTTPRedirection
+            return read_url(URI.join(url, response["location"]).to_s, code: code,
+                            redirects_left: redirects_left - 1, headers: headers,
+                            retry_extra_statuses: retry_extra_statuses)
+          else
+            status = response.code.to_i
+            if retryable_status?(status, retry_extra_statuses) && retry_attempt(url, attempt + 1, "#{response.code} #{response.message}")
+              next
+            end
+
+            raise TebakoRBuilder::Error.new("#{response.code} #{response.message} fetching #{url}", code)
+          end
+        end
+      end
+
+      # True when the HTTP status is one a retry can honestly fix.
+      def retryable_status?(status, extra = [])
+        READ_URL_RETRYABLE_STATUSES.include?(status) || extra.include?(status) || status >= 500
+      end
+
+      # Names a failed attempt on stderr and sleeps out the backoff; true
+      # while another attempt remains, false once the budget is spent (the
+      # caller then raises the named failure).
+      def retry_attempt(url, attempt, reason)
+        return false if attempt >= READ_URL_ATTEMPTS
+
+        delay = READ_URL_BACKOFF_BASE**attempt
+        warn "attempt #{attempt}/#{READ_URL_ATTEMPTS} failed fetching #{url}: #{reason} — retrying in #{delay}s"
+        sleep delay
+        true
+      end
+
+      def read_file_url(uri, code)
+        path = uri.path
+        File.binread(path)
+      rescue Errno::ENOENT
+        raise TebakoRBuilder::Error.new("not found: #{path}", code)
+      end
+
+      def http_get(uri, headers = {})
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = uri.scheme == "https"
+        http.open_timeout = 15
+        http.read_timeout = 600
+        http.start do |session|
+          session.get(uri.request_uri.empty? ? "/" : uri.request_uri, headers)
+        end
+      end
+
+      # The GitHub release API's per-asset digest map for a tag:
+      # { asset_name => "<sha256 hex>" }. The release API's digest field is
+      # the link-unit's trust anchor (tebako-runtime-ruby
+      # ci/link-unit-download.sh): the release SHA256SUMS does not cover
+      # the link-unit assets. GITHUB_TOKEN/GH_TOKEN, when present, rides
+      # the request (CI rate limits); the release is public, so an
+      # unauthenticated read works at interactive rates.
+      def release_asset_digests(repo, tag, code:) # rubocop:disable Metrics/MethodLength
+        url = "https://api.github.com/repos/#{repo}/releases/tags/#{tag}"
+        headers = { "Accept" => "application/vnd.github+json" }
+        token = ENV.fetch("GITHUB_TOKEN", nil) || ENV.fetch("GH_TOKEN", nil)
+        headers["Authorization"] = "Bearer #{token}" if token && !token.empty?
+
+        # The release lookup rides the 404-retry budget: this endpoint
+        # answers 404 transiently (API propagation and shared-IP rate
+        # limits), and one such answer used to kill every matrix leg.
+        data = JSON.parse(read_url(url, code: code, headers: headers, retry_extra_statuses: [404]))
+        (data["assets"] || []).each_with_object({}) do |asset, acc|
+          digest = asset["digest"].to_s
+          acc[asset["name"]] = digest.delete_prefix("sha256:") if digest.start_with?("sha256:")
+        end
+      rescue JSON::ParserError => e
+        raise TebakoRBuilder::Error.new("unparseable release API response for #{repo}@#{tag}: #{e.message}", code)
+      end
+    end
+  end
+end

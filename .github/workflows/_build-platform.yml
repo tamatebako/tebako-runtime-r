@@ -1,0 +1,460 @@
+# Copyright (c) 2026 [Ribose Inc](https://www.ribose.com).
+# All rights reserved.
+# This file is a part of tamatebako
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+# The ONE per-platform build workflow (tebako-runtime-php's
+# _build-platform.yml port, at this factory's skeleton scope — the
+# linux-gnu container leg only; no publish/sign jobs, no macos arms,
+# no windows legs: those increments are named in README.md). Called by
+# the thin platform trigger (build-linux-gnu.yml) — never dispatched
+# directly.
+#
+# Stage 0 (parity): the contract gate's driver-source parity arm needs the
+#   pinned link-unit release's lib.rs — a raw.githubusercontent.com fetch
+#   that flakes under near-simultaneous per-platform reads
+#   (tamatebako/tebako-runtime-python#4). ONE dedicated job fetches it
+#   (bounded retry inside BuildHelpers.read_url) and hands it to the
+#   compute job as an artifact, so a flaky fetch fails this one retried
+#   job instead of a platform's whole compute leg.
+# Stage 1 (compute): the contract gate (schema + pins + the parity arm,
+#   reading the stage-0 artifact via TEBAKO_DRIVER_SRC — fail-closed
+#   exactly as before) runs, then scripts/compute_matrix.rb expands THIS
+#   platform's legs under the dispatch filters. Every downstream value
+#   flows from these outputs — workflow YAML never hardcodes a version, a
+#   tag, or a SHA (ecosystem SSOT invariant). The run's SOURCE_DATE_EPOCH
+#   (the HEAD commit's epoch, ruby#381's idiom) is computed here too, so
+#   every leg stamps the SAME build timestamp into the image manifest.
+# Stage 2 (preflight): the container digest pins (ruby#381's idiom, born
+#   pinned here): contract.yml's container_digests must match the
+#   registry's CURRENT digest for the tag — per (container x leg arch) —
+#   before any leg spends compute; the legs then pull name:tag@digest, so
+#   the toolchain container can never move under the matrix.
+# Stage 3 (build): one leg per (R x arch) of this platform:
+#   tools/build_runtime -> ci/check_symbol_provenance.sh ->
+#   tools/boot_smoke -> the runtime-packages-<os>-<arch>-<r> artifact.
+#   The build scripts fetch and sha256-verify every input themselves (the
+#   pinned source tarball off versions.yml, the pinned link unit, the tfs
+#   CLI) — there is NO source-build path for the driver stack here
+#   (contract.yml's link_unit_release comment), so the ruby factory's
+#   whole link-unit staging job has no counterpart.
+#
+# The build leg provisions IN-CONTAINER (contract.yml's container note):
+# the v1 tpkg-builder gnu image lacks gfortran (R's internal LAPACK is
+# Fortran), and liblzma-dev and libpcre2-dev (R 4.6 dropped its bundled
+# xz and pcre2), so the build step apt-installs them before configure.
+# The named follow-up is baking the three into tebako-ci-containers —
+# see docs/build-chain.md. (No libssl-dev and no zlib1g-dev reliance:
+# the deps stage builds its own static OpenSSL 3 — the focal image's
+# 1.1.1 is EOL and too old for curl 8.23 — and its own -fPIC static
+# zlib, because the image's libz.a carries no PIC and internet.so links
+# -lz into a shared object.)
+#
+# Container grammar (the other factories'): the linux legs run on the
+# ubuntu host and docker-run the tpkg-builder image per step (the job-
+# level container: form is out — the musl image is alpine-based and node
+# actions cannot run on musl, and uniformity beats a per-image branch).
+#
+# The cache holds ONLY the sha256-verified downloads (.build/downloads)
+# and the staged link unit (.build/link-unit): a restored entry re-verifies
+# against the pins on use, so a poisoned or stale cache cannot survive a
+# pin bump (the key also carries the pins' hashes). save-always: a red
+# boot smoke must never tax the next leg a cold re-download (the ruby
+# factory's msys campaign lesson). CACHE_VER stays the manual escape
+# hatch.
+name: _build-platform
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: 'This call''s platform: linux-gnu'
+        required: true
+        type: string
+      r_filter:
+        description: 'R versions: "full", "tidy", "catalog", or comma-separated versions'
+        type: string
+        default: 'full'
+      arch_filter:
+        description: 'Arch slice: "all" or an arch (x86_64 | arm64)'
+        type: string
+        default: 'all'
+
+env:
+  CACHE_VER: 1
+
+jobs:
+  # The parity artifact, fetched ONCE per call: the driver-source parity
+  # arm's second representation (the pinned link-unit release's lib.rs)
+  # off raw.githubusercontent.com — a transient-failure surface that used
+  # to ride inside every platform's compute step, where one flake red-ed
+  # the whole platform and the ::error:: never reached the log
+  # (tamatebako/tebako-runtime-python#4). The fetch retries with backoff
+  # (BuildHelpers.read_url) and names every failed attempt on stderr; the
+  # compute job below consumes the artifact, never the network.
+  parity:
+    name: Fetch the driver parity source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - name: Fetch the pinned driver's parity source
+        run: bundle exec scripts/check_contract.rb --fetch-parity .build/parity/lib.rs
+
+      # Artifact names are per workflow RUN.
+      - name: Upload the parity source
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: driver-parity-src-${{ inputs.platform }}
+          path: .build/parity/lib.rs
+          retention-days: 1
+
+  compute:
+    name: Compute the ${{ inputs.platform }} legs
+    needs: parity
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.emit.outputs.run }}
+      leg_count: ${{ steps.emit.outputs.leg_count }}
+      legs: ${{ steps.emit.outputs.legs }}
+      tebako_version: ${{ steps.emit.outputs.tebako_version }}
+      container_version: ${{ steps.emit.outputs.container_version }}
+      container_digests: ${{ steps.emit.outputs.container_digests }}
+      source_date_epoch: ${{ steps.get-sde.outputs.epoch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The source-date epoch below reads the HEAD commit's own time
+          # (git log -1 --format=%ct) — full history, never the depth-1
+          # default (ruby#381's idiom).
+          fetch-depth: 0
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      # The parity artifact the stage-0 job fetched — the gate's parity
+      # arm reads THIS file (TEBAKO_DRIVER_SRC), never the network.
+      - name: Download the parity source
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: driver-parity-src-${{ inputs.platform }}
+          path: .build/parity
+
+      # The contract gate first: contract.yml against its schema, the
+      # catalog resolvable AND cross-locked to versions.yml's source pins,
+      # AND the driver-source parity arm (the pinned link-unit release's
+      # TEBAKO_CONTRACT_VERSION vs contract_version) — fail-closed, now
+      # against the fetched artifact (a missing/unreadable file fails the
+      # arm exactly like a failed fetch did).
+      - name: validate the contract
+        env:
+          TEBAKO_DRIVER_SRC: .build/parity/lib.rs
+        run: bundle exec scripts/check_contract.rb
+
+      - id: emit
+        env:
+          R_FILTER: ${{ inputs.r_filter }}
+          PLATFORM_FILTER: ${{ inputs.platform }}
+          ARCH_FILTER: ${{ inputs.arch_filter }}
+        run: |
+          set -euo pipefail
+          legs=$(scripts/compute_matrix.rb)
+          count=$(jq '.include | length' <<< "$legs")
+          {
+            echo "legs=$legs"
+            echo "leg_count=$count"
+            if [ "$count" -gt 0 ]; then echo "run=true"; else echo "run=false"; fi
+            echo "tebako_version=$(cat VERSION)"
+            echo "container_version=$(scripts/versions --pin container_version)"
+            echo "container_digests=$(ruby -ryaml -rjson -e '
+              d = YAML.load_file("contract.yml")["container_digests"]
+              abort("contract.yml declares no container_digests") if d.nil? || d.empty?
+              print JSON.generate(d)
+            ')"
+          } >> "$GITHUB_OUTPUT"
+          # Mirror the plan to the LOG: values written only to
+          # $GITHUB_OUTPUT leave no diagnosable record when the legs skip.
+          echo "plan (${{ inputs.platform }}): $count legs (r=${R_FILTER} arch=${ARCH_FILTER})"
+          jq -r '.include[] | "  \(.r) \(.os)/\(.arch) on \(.host)"' <<< "$legs"
+
+      # The run's build timestamp: ONE value for the whole run — the HEAD
+      # commit time — so every leg stamps the SAME SOURCE_DATE_EPOCH into
+      # the image manifest's identity.created (ImageManifest honors it;
+      # unset falls to epoch 0). The full-history checkout above makes %ct
+      # the commit's own time, never the run's wall clock — a same-commit
+      # re-run reproduces it (ruby#381's idiom).
+      - name: Get the source-date epoch
+        id: get-sde
+        run: |
+          sde=$(git log -1 --format=%ct)
+          echo "SOURCE_DATE_EPOCH for this run: $sde"
+          echo "epoch=$sde" >> "$GITHUB_OUTPUT"
+
+  preflight:
+    name: Verify the toolchain container digests
+    needs: compute
+    if: ${{ needs.compute.outputs.run == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify every referenced container manifest exists at its recorded digest
+        env:
+          LEGS: ${{ needs.compute.outputs.legs }}
+          CONTAINER_VERSION: ${{ needs.compute.outputs.container_version }}
+          CONTAINER_DIGESTS: ${{ needs.compute.outputs.container_digests }}
+        run: |
+          set -u
+          # One record per (container x leg arch): the digest grammar keys
+          # docker arch names (amd64/arm64), the legs key x86_64/arm64.
+          pairs=$(printf '%s' "$LEGS" | jq -r '.include[] | select(.container != null) | .container + " " + .arch' | sed 's/:[^:]* / /' | sort -u)
+          [ -n "$pairs" ] || { echo "no containerized legs; nothing to preflight"; exit 0; }
+          missing=0
+          while read -r ref arch; do
+            [ -n "$ref" ] || continue
+            c="${ref#ghcr.io/tamatebako/}"
+            case "$arch" in
+              x86_64) carch=amd64 ;;
+              arm64)  carch=arm64 ;;
+              *) echo "::error::unknown leg arch $arch"; missing=1; continue ;;
+            esac
+            recorded=$(printf '%s' "$CONTAINER_DIGESTS" | jq -r --arg c "$c" --arg a "$carch" '.[$c][$a] // empty')
+            if [ -z "$recorded" ]; then
+              echo "::error::contract.yml container_digests records no digest for $c/$carch — record the published digest there"
+              missing=1
+              continue
+            fi
+            # ghcr's anonymous-token flow (no docker login on this job):
+            # the manifest GET's Docker-Content-Digest header is the
+            # registry's CURRENT digest for the tag — a retagged image
+            # (a toolchain move under an unchanged tag) shows here.
+            token=$(curl -fsSL "https://ghcr.io/token?scope=repository:tamatebako/${c}:pull" | jq -r .token) || token=
+            live=$(curl -fsSL -o /dev/null -D - \
+              -H "Authorization: Bearer ${token}" \
+              -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json" \
+              "https://ghcr.io/v2/tamatebako/${c}/manifests/${CONTAINER_VERSION}" \
+              | tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: //p') || live=
+            if [ -z "$live" ]; then
+              echo "::error::missing toolchain container: ${ref}:${CONTAINER_VERSION}"
+              missing=1
+            elif [ "$live" != "$recorded" ]; then
+              echo "::error::${ref}:${CONTAINER_VERSION} moved: recorded $recorded, live $live — a retagged toolchain container under an unchanged tag; repin contract.yml container_digests only as a reviewed toolchain bump"
+              missing=1
+            else
+              echo "ok: ${ref}:${CONTAINER_VERSION} @ $live"
+            fi
+          done <<< "$pairs"
+          [ "$missing" -eq 0 ] || { echo "::error::preflight failed — publish the containers or fix container_version/container_digests in contract.yml"; exit 1; }
+
+  build:
+    name: ${{ matrix.r }} / ${{ matrix.os }}-${{ matrix.arch }}
+    needs: [compute, preflight]
+    # An unguarded empty matrix poisons the run conclusion. No always()
+    # here: a FAILED preflight (a moved toolchain container) must skip
+    # the legs outright — the verify job reports it by name.
+    if: ${{ needs.compute.outputs.run == 'true' }}
+    runs-on: ${{ matrix.host }}
+    # A hung leg fails loudly at the cap, never silently (the ruby
+    # factory's 150-minute record is the reference).
+    timeout-minutes: 150
+    # build_runtime's release-digest fetches ride the GitHub API;
+    # unauthenticated calls share the runner NAT's 60/h budget and die on
+    # 403 flakes (the python factory's 02 round-4 macos leg).
+    # secrets.GITHUB_TOKEN raises the budget to 5000/h; the container leg
+    # forwards it via -e below. SOURCE_DATE_EPOCH is the compute job's
+    # run-wide value (ruby#381); the container leg forwards it too.
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SOURCE_DATE_EPOCH: ${{ needs.compute.outputs.source_date_epoch }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.compute.outputs.legs) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Create folder for runtime packages
+        run: mkdir -p runtime-packages
+
+      - name: Cache the verified downloads + the staged link unit
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .build/downloads
+            .build/link-unit
+          key: tebako-r-dl-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('contract.yml', 'versions.yml') }}-v${{ env.CACHE_VER }}
+          save-always: true
+
+      # --- build (the container legs docker-run the digest-pinned
+      # tpkg-builder image per step — the preflight proved the pin).
+      # The in-container apt provisioning is the header's named follow-up:
+      # gfortran (the internal LAPACK is Fortran), liblzma-dev, and
+      # libpcre2-dev (R 4.6 dropped its bundled xz/pcre2) are not baked
+      # into the v1 image. The toolchain PPA (ppa.launchpad.net)
+      # intermittently 503s mid-fetch; the apt phase therefore repoints
+      # the source at ppa.launchpadcontent.net (same content, steady)
+      # and retries. ---------------------------------------------------
+      - name: Build the runtime (container legs)
+        env:
+          CONTAINER_DIGESTS: ${{ needs.compute.outputs.container_digests }}
+        run: |
+          set -euo pipefail
+          c="${{ matrix.container }}"
+          name="${c%:*}"
+          case "${{ matrix.arch }}" in
+            x86_64) carch=amd64 ;;
+            arm64)  carch=arm64 ;;
+            *) echo "::error::unknown leg arch ${{ matrix.arch }}"; exit 1 ;;
+          esac
+          digest=$(printf '%s' "$CONTAINER_DIGESTS" | jq -r --arg c "${name#ghcr.io/tamatebako/}" --arg a "$carch" '.[$c][$a] // empty')
+          [ -n "$digest" ] || { echo "::error::no recorded container digest for $name/$carch"; exit 1; }
+          image="${c}@${digest}"
+          echo "Building in $image"
+          docker run --rm -e GITHUB_TOKEN -e SOURCE_DATE_EPOCH \
+            -v "${{ github.workspace }}:/mnt/w" -w /mnt/w \
+            "$image" bash -c '
+              set -e
+              grep -rl "ppa\.launchpad\.net" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | \
+                while read -r f; do sed -i "s/ppa\.launchpad\.net/ppa.launchpadcontent.net/g" "$f"; done
+              ok=0
+              for i in 1 2 3 4 5 6; do
+                apt-get update -qq 2>&1 | tee /tmp/apt-update.log > /dev/null || true
+                if ! grep -q "Failed to fetch" /tmp/apt-update.log && apt-cache policy gfortran-11 | grep -q "Candidate: [0-9]"; then
+                  ok=1; break
+                fi
+                echo "apt update attempt $i incomplete (PPA hiccup); retrying in 20s"; sleep 20
+              done
+              [ "$ok" = 1 ] || { echo "the toolchain PPA index never came back"; exit 1; }
+              ok=0
+              for i in 1 2 3 4 5 6; do
+                if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+                  gfortran-11 liblzma-dev libpcre2-dev > /tmp/apt-install.log 2>&1; then
+                  ok=1; break
+                fi
+                echo "apt install attempt $i failed (PPA hiccup); retrying in 20s"; tail -3 /tmp/apt-install.log; sleep 20
+              done
+              [ "$ok" = 1 ] || { echo "the toolchain PPA pool never came back"; exit 1; }
+              update-alternatives --install /usr/bin/gfortran gfortran /usr/bin/gfortran-11 110
+              tools/build_runtime --r "${{ matrix.r }}"
+              # Root in the container writes root-owned files onto the
+              # bind mount; hand them back to the runner user so the host
+              # steps (cache save, artifact upload) can read/write them.
+              uid=$(stat -c %u /mnt/w/contract.yml); gid=$(stat -c %g /mnt/w/contract.yml)
+              chown -R "$uid:$gid" /mnt/w/.build /mnt/w/runtime-packages 2>/dev/null || true'
+
+      # --- the gates ------------------------------------------------------
+      - name: Check symbol provenance (container legs)
+        env:
+          CONTAINER_DIGESTS: ${{ needs.compute.outputs.container_digests }}
+        run: |
+          set -euo pipefail
+          c="${{ matrix.container }}"
+          name="${c%:*}"
+          case "${{ matrix.arch }}" in
+            x86_64) carch=amd64 ;;
+            arm64)  carch=arm64 ;;
+            *) echo "::error::unknown leg arch ${{ matrix.arch }}"; exit 1 ;;
+          esac
+          digest=$(printf '%s' "$CONTAINER_DIGESTS" | jq -r --arg c "${name#ghcr.io/tamatebako/}" --arg a "$carch" '.[$c][$a] // empty')
+          [ -n "$digest" ] || { echo "::error::no recorded container digest for $name/$carch"; exit 1; }
+          docker run --rm -v "${{ github.workspace }}:/mnt/w" -w /mnt/w \
+            "${c}@${digest}" bash -c '
+              set -e
+              ci/check_symbol_provenance.sh --exe \
+                "runtime-packages/tebako-runtime-${{ needs.compute.outputs.tebako_version }}-r-${{ matrix.r }}-${{ matrix.host_id }}"'
+
+      # The boot smoke resolves the exe from TEBAKO_RUNTIME_ROOT.
+      # TEBAKO_TFS names the tfs CLI the build fetched (the fixture-image
+      # scenarios pack with it) — inside the container legs it is the
+      # gnu binary matching the image.
+      - name: Boot smoke (container legs)
+        env:
+          CONTAINER_DIGESTS: ${{ needs.compute.outputs.container_digests }}
+        run: |
+          set -euo pipefail
+          c="${{ matrix.container }}"
+          name="${c%:*}"
+          case "${{ matrix.arch }}" in
+            x86_64) carch=amd64 ;;
+            arm64)  carch=arm64 ;;
+            *) echo "::error::unknown leg arch ${{ matrix.arch }}"; exit 1 ;;
+          esac
+          digest=$(printf '%s' "$CONTAINER_DIGESTS" | jq -r --arg c "${name#ghcr.io/tamatebako/}" --arg a "$carch" '.[$c][$a] // empty')
+          [ -n "$digest" ] || { echo "::error::no recorded container digest for $name/$carch"; exit 1; }
+          docker run --rm -v "${{ github.workspace }}:/mnt/w" -w /mnt/w \
+            "${c}@${digest}" bash -c '
+              set -e
+              export TEBAKO_RUNTIME_ROOT=runtime-packages
+              TEBAKO_TFS=$(echo .build/downloads/tfs/*/tfs-*)
+              export TEBAKO_TFS
+              tools/boot_smoke'
+
+      # The leg's workspace, kept for a day as build diagnostics: one
+      # artifact per (platform, arch, R) leg, immutable across the run's
+      # attempts. Uploads even when the build or boot smoke failed
+      # (always()) — a red leg's packages are exactly the ones worth
+      # diagnosing.
+      - name: Upload the runtime packages
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runtime-packages-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.r }}
+          include-hidden-files: true
+          path: runtime-packages
+          retention-days: 1
+
+  # The terminal aggregate — and the branch-protection gate. The build
+  # legs are a dynamic matrix whose check names shift with the catalog
+  # (a version bump renames every leg), so protection pins this job's
+  # stable per-platform check name ("<platform> / all legs green")
+  # instead of any leg's. Green means: the contract/matrix computed, the
+  # container pins proved, and every emitted leg succeeded; a platform
+  # whose filter emits no legs gates on compute alone.
+  verify:
+    name: all legs green
+    needs: [parity, compute, preflight, build]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on the legs
+        run: |
+          set -euo pipefail
+          echo "parity:    ${{ needs.parity.result }}"
+          echo "compute:   ${{ needs.compute.result }} (run=${{ needs.compute.outputs.run }}, legs=${{ needs.compute.outputs.leg_count }})"
+          echo "preflight: ${{ needs.preflight.result }}"
+          echo "build:     ${{ needs.build.result }}"
+          if [ "${{ needs.compute.result }}" != "success" ]; then
+            echo "::error::the contract/matrix computation failed"
+            exit 1
+          fi
+          if [ "${{ needs.compute.outputs.run }}" = "true" ] && [ "${{ needs.preflight.result }}" != "success" ]; then
+            echo "::error::the container preflight failed: ${{ needs.preflight.result }}"
+            exit 1
+          fi
+          if [ "${{ needs.compute.outputs.run }}" = "true" ] && [ "${{ needs.build.result }}" != "success" ]; then
+            echo "::error::not every ${{ inputs.platform }} leg succeeded: ${{ needs.build.result }}"
+            exit 1
+          fi

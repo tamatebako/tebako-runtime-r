@@ -1,0 +1,151 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Copyright (c) 2026 [Ribose Inc](https://www.ribose.com).
+# All rights reserved.
+# This file is a part of tamatebako
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+# TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+# PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+# INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+# CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+# ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+# POSSIBILITY OF SUCH DAMAGE.
+
+# Build a tebako R runtime package from the pristine CRAN release tarball
+# (R-<version>.tar.gz, sha256-verified against versions.yml's pins), with
+# the spec-17 driver LINKED into the R interpreter exe src/main/R.bin (the
+# README's LINKED-driver decision — NOT Rscript: upstream's Rscript is a
+# launcher that execv()s R_HOME/bin/R, a shell script, and a script
+# inside the VFS cannot be exec'd). The R analog of
+# tebako-runtime-php's tools/build_runtime; the orchestration model is
+# its build/lib port.
+#
+# The phases (the php leg's stage order):
+#   1. fetch + verify    the R tarball (SourceFetcher — versions.yml's
+#                        sha256 pins are the trust anchor)
+#   2. link unit + tfs   download + verify link-unit-<ver>-<pid>.tar.gz
+#                        (release-API digest anchor; LinkUnit) and the
+#                        tfs CLI (published .sha256 sidecar; TfsTool),
+#                        both off contract.yml's link_unit_release pin
+#   3. deps + configure  RBuild#build_deps first builds the factory-built
+#   + make               libraries (today: the minimal static libcurl R
+#                        4.6 hard-requires — versions.yml's deps: pin),
+#                        then the headless static R interpreter
+#                        (RBuild: prefix = the mount root; the feature
+#                        policy is RBuild::CONFIGURE_ARGS — README's
+#                        table)
+#   4. driver link       the fs TU (build/resources/tebako_r_main.c)
+#                        joins the R.bin link via the generated-Makefile
+#                        substitution (Rmain.c's main renamed to r_main
+#                        at compile time; the link recipe gains the fs TU
+#                        object + $(TEBAKO_LIBS) — Mlibs)
+#   5. env image         the pruned install tree (layout card, preload
+#                        shim, L1 manifest) packed by `tfs mkimage` (the
+#                        default limnifs writer)
+#   6. package           runtime-packages/tebako-runtime-<tebako>-r-
+#                        <r>-<triplet> + .tfs + sidecars (.sha256 for the
+#                        image, .abi, .contract.yaml)
+#   7. boot smoke        tools/boot_smoke (a separate entry — CI runs it
+#                        as its own step)
+#
+# Exit codes (named, never silent): 64 usage · 103 configure · 104 build
+# · 105 install/assemble · 109 version grammar · 112 platform/link input
+# · 121/122 source fetch (sha mismatch / download) · 123 link-unit
+# miss/download · 124 link-unit sha mismatch/incomplete · 125 tfs CLI
+# fetch/verify · 131 image assemble/pack · 141/143 boot smoke
+# (tools/boot_smoke).
+#
+# Usage:
+#   tools/build_runtime --r 4.6.2 [--output PATH] [--prefix DIR]
+#                       [--tebako-version X.Y.Z] [--src-mirror URL]
+#                       [--link-unit-release TAG] [--link-unit-pid PID]
+#                       [--arch ARCH] [--jobs N]
+
+require "optparse"
+
+REPO_ROOT = File.expand_path("..", __dir__).freeze
+$LOAD_PATH.unshift(File.join(REPO_ROOT, "build", "lib"))
+
+require "tebako_r_builder"
+
+options = {
+  r: nil,
+  output: nil,
+  prefix: File.join(REPO_ROOT, ".build"),
+  tebako_version: nil,
+  src_mirror: nil,
+  link_unit_release: nil,
+  link_unit_pid: nil,
+  arch: nil,
+  jobs: nil
+}
+
+parser = OptionParser.new do |opts|
+  opts.banner = "Usage: tools/build_runtime [options]"
+  opts.on("--r VERSION", "R version to build (e.g. 4.6.2), required") { |v| options[:r] = v }
+  opts.on("-o", "--output PATH", "Output runtime package path " \
+                                 "(default: runtime-packages/tebako-runtime-<tebako>-r-<r>-<triplet>)") do |v|
+    options[:output] = v
+  end
+  opts.on("-p", "--prefix DIR", "Build prefix holding deps and the build trees (default: #{options[:prefix]})") { |v| options[:prefix] = v }
+  opts.on("--tebako-version VERSION", "Runtime package version (default: the VERSION file)") { |v| options[:tebako_version] = v }
+  opts.on("--src-mirror URL", "Base URL override for the source assets (file:// URLs work)") do |v|
+    options[:src_mirror] = v
+  end
+  opts.on("--link-unit-release TAG", "tamatebako/tebako release tag for the link unit + tfs CLI " \
+                                     "(default: contract.yml's link_unit_release)") do |v|
+    options[:link_unit_release] = v
+  end
+  opts.on("--link-unit-pid PID", "The product release's platform id for the link-unit asset " \
+                                 "(default: the detected host's)") { |v| options[:link_unit_pid] = v }
+  opts.on("--arch ARCH", "The leg's declared target arch (x86_64 | arm64) — pass it on emulated " \
+                         "tooling; default: the tooling process's self-report") { |v| options[:arch] = v }
+  opts.on("-j", "--jobs N", Integer, "Build parallelism (default: detected core count)") { |v| options[:jobs] = v }
+  opts.on("-h", "--help", "Print this help") do
+    puts opts
+    exit 0
+  end
+end
+parser.parse!
+
+begin
+  if options[:r].nil?
+    puts "Missing required option: --r VERSION"
+    puts parser
+    exit 64
+  end
+
+  tebako_version = options[:tebako_version] || File.read(File.join(REPO_ROOT, "VERSION")).strip
+  builder = TebakoRBuilder::Builder.new(
+    repo_root: REPO_ROOT,
+    r_version: options[:r],
+    tebako_version: tebako_version,
+    prefix: options[:prefix],
+    output: options[:output],
+    jobs: options[:jobs],
+    src_mirror: options[:src_mirror],
+    link_unit_release: options[:link_unit_release],
+    link_unit_pid: options[:link_unit_pid],
+    arch: options[:arch]
+  )
+  builder.run
+rescue TebakoRBuilder::Error => e
+  puts "build_runtime failed: #{e.message} [#{e.error_code}]"
+  exit(e.error_code)
+end
+exit(0)
