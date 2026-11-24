@@ -1,0 +1,46 @@
+# =============================================================================
+# tpkg-registry.yaml — the tebako-runtime-r runtime registry (spec 04 §2)
+#
+# OWNED BY tools/registry_update.rb — rendered from a release's per-package
+# .manifest.json shards by the publish workflow's release job and
+# landed on main by bot PR (spec 13 §2a). NEVER hand-edit: the one sanctioned
+# manual mark is `status: withdrawn` on a version entry (spec 04 §2 — release
+# assets are immutable, so withdrawal is the only remedy for a bad published
+# artifact), and the renderer preserves those marks across renders.
+#
+# kind: runtime entries carry NO entrypoints key (the registry validator:
+# only apps and toolkits declare entrypoints) and ALWAYS carry `engine`
+# (spec 04 §2 MINOR 1 — the edge-discovery key; an engine-less runtime
+# entry is invisible to `kind: runtime` edges) AND `implementation`
+# (spec 28 §8 — the flavor axis; an implementation-named edge sees only
+# entries carrying its key). Versions are the composite
+# `<r>-<tebako>` keys (one R ships on several tebako lines; the
+# composite keeps every line addressable).
+# =============================================================================
+schema_version: 1
+payloads:
+- name: r
+  kind: runtime
+  versions:
+  - version: 4.6.2-0.1.0
+    platforms:
+      aarch64-linux-musl:
+        artifact: tebako-runtime-0.1.0-r-4.6.2-linux-musl-arm64.tfs
+        sha256: b0fde39d533ba848b88d11c5e89ac800d059419cd99eeef17cc9253381de2c3c
+      aarch64-macos:
+        artifact: tebako-runtime-0.1.0-r-4.6.2-macos-arm64.tfs
+        sha256: eb46cdc6e38b3fa5868925376ebc3fb24361b6d80849e70e3978fab84ad9cfe7
+      x86_64-linux-gnu:
+        artifact: tebako-runtime-0.1.0-r-4.6.2-linux-gnu-x86_64.tfs
+        sha256: 5c355cb289e760d4c1a9635230a1d4a0359e6c7f16e813053c318d7f4c6a8860
+      x86_64-linux-musl:
+        artifact: tebako-runtime-0.1.0-r-4.6.2-linux-musl-x86_64.tfs
+        sha256: 2d6437e6b9ff1bb85a5a65123980a77beaa2abdd089ca0cfbec5ecbfe6f5afe3
+      x86_64-macos:
+        artifact: tebako-runtime-0.1.0-r-4.6.2-macos-x86_64.tfs
+        sha256: 207063649165dccf98de7ab960686c92c9193e9d295b13f392d9f0d788eb82f7
+    release:
+      ref: tfs:github:tamatebako/tebako-runtime-r:v0.1.0
+  engine: r
+  implementation: r
+  default: 4.6.2-0.1.0
