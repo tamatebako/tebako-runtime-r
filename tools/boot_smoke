@@ -98,11 +98,38 @@
 #   override-ungranted   TEBAKO_MOUNT_ROOT against an env image whose
 #                        layout lacks the grant -> exit 78
 #
+# The installed-pair scenario (explicit opt-in ONLY — never in "all"):
+#
+#   published-pair       the census acceptance shape through the REAL
+#                        install machinery: <tebako CLI> add-registry
+#                        <ref> + install r into a scratch TEBAKO_HOME,
+#                        then the materialized <home>/shims/r answers
+#                        --version, EXECUTES -e (the census probe), and
+#                        computes the LAPACK solve. The build-tree
+#                        scenarios above cannot see this flow: what they
+#                        boot is the freshly built pair off
+#                        TEBAKO_RUNTIME_IMAGE; what a user runs is the
+#                        registry default's bytes, fetched + mounted by
+#                        the loader and dispatched by the shim.
+#                        tebako-runtime-r#5 is the class it gates: the
+#                        published macos-arm64 pair answered --version
+#                        and died on -e (the missing
+#                        allow-dyld-environment-variables grant —
+#                        tolerated by the macos-15 runners' dyld, fatal
+#                        on macOS 14). publish.yml's acceptance jobs run
+#                        this scenario per leg once the registry row
+#                        lands on main; run by hand it exercises whatever
+#                        pair the registry default names NOW.
+#
 # Usage:
 #   tools/boot_smoke [--runtime-root DIR | --exe PATH] [--tfs PATH]
 #                    [--scenario all|bare|boot|payload|compute-floor|
 #                                bad-mount|mount-root-override|
-#                                mount-root-malformed|override-ungranted]
+#                                mount-root-malformed|override-ungranted|
+#                                published-pair]
+#                    [--tebako PATH] [--registry REF] [--home DIR]
+#
+# (--tebako/--registry/--home serve the published-pair scenario only.)
 #
 # Exit codes: 0 green · 141 usage/resolution · 143 a scenario failed.
 
@@ -130,6 +157,10 @@ COMPUTE_FLOOR_SECONDS = 10.0
 IMAGE_SUFFIXES = %w[.tfs .dwarfs].freeze
 MARKER_SUFFIXES = %w[.abi .sha256 .origin .yaml .dll].freeze
 NON_EXECUTABLE_SUFFIXES = (IMAGE_SUFFIXES + MARKER_SUFFIXES).freeze
+
+# The published-pair scenario's default registry: THIS factory's live
+# registry (the resolver fetches it at its default branch).
+DEFAULT_REGISTRY = "tfs:github:tamatebako/tebako-runtime-r"
 
 # The child env is REPLACED, not inherited: any tebako/preload leftovers
 # a host setup would leak in are scrubbed (the ruby factory's msys
@@ -165,7 +196,8 @@ unless %w[fail warn].include?(COMPUTE_FLOOR_MODE)
   usage_error("COMPUTE_FLOOR_MODE=#{COMPUTE_FLOOR_MODE.inspect} — known: fail (the default), warn")
 end
 
-options = { runtime_root: ENV.fetch("TEBAKO_RUNTIME_ROOT", nil), exe: nil, tfs: nil, scenario: "all" }
+options = { runtime_root: ENV.fetch("TEBAKO_RUNTIME_ROOT", nil), exe: nil, tfs: nil, scenario: "all",
+            tebako: nil, registry: DEFAULT_REGISTRY, home: nil }
 parser = OptionParser.new do |opts|
   opts.banner = "Usage: tools/boot_smoke [options]"
   opts.on("--runtime-root DIR", "Directory holding exactly one tebako-runtime-* executable") do |v|
@@ -176,6 +208,13 @@ parser = OptionParser.new do |opts|
     options[:tfs] = v
   end
   opts.on("--scenario NAME", "One scenario to run (default: all)") { |v| options[:scenario] = v }
+  opts.on("--tebako PATH", "tebako CLI for the published-pair scenario (default: TEBAKO_CLI, then tebako on PATH)") do |v|
+    options[:tebako] = v
+  end
+  opts.on("--registry REF", "Registry the published-pair scenario installs from (default: #{DEFAULT_REGISTRY})") do |v|
+    options[:registry] = v
+  end
+  opts.on("--home DIR", "TEBAKO_HOME for the published-pair scenario (default: a mktmpdir)") { |v| options[:home] = v }
   opts.on("-h", "--help", "Print this help") do
     puts opts
     exit 0
@@ -211,6 +250,18 @@ def resolve_tfs(requested)
   end
   usage_error("no tfs CLI resolvable (#{candidate}) — the fixture-image scenarios need it " \
               "(--tfs / TEBAKO_TFS; tools/build_runtime already fetched one under .build)")
+end
+
+def resolve_tebako_cli(requested)
+  candidate = requested || ENV.fetch("TEBAKO_CLI", nil) || "tebako"
+  return File.expand_path(candidate) if File.file?(candidate) && File.executable?(candidate)
+
+  ENV.fetch("PATH", "").split(File::PATH_SEPARATOR).each do |dir|
+    path = File.join(dir, candidate)
+    return path if File.file?(path) && File.executable?(path)
+  end
+  usage_error("no tebako CLI resolvable (#{candidate}) — the published-pair scenario drives the install " \
+              "machinery (--tebako / TEBAKO_CLI; tamatebako/tebako's releases ship the per-platform CLI)")
 end
 
 # --- scenario drivers ------------------------------------------------------
@@ -306,16 +357,94 @@ def ungranted_fixture(tfs, dir, platform)
   image
 end
 
+# --- the published-pair scenario (the header's installed-pair block) ---
+
+# The child env for the CLI steps: boot()'s scrub (tebako/preload
+# leftovers and host R_* keys never leak in), plus TEBAKO_HOME pointed
+# at the scenario's store.
+def cli_env(home)
+  env = ENV_SCRUBBED.to_h { |key| [key, nil] }
+  ENV.each_key { |key| env[key] = nil if key.start_with?("TEBAKO_") }
+  env.merge("TEBAKO_HOME" => home)
+end
+
+# The install steps are GATES: a red add-registry/install leaves the
+# exec probes nothing to run against — record the failure, name the
+# step, and stop the scenario there.
+def cli_gate(name, tebako, home, argv)
+  out, err, st = Open3.capture3(cli_env(home), tebako, *argv)
+  check("published-pair: #{name}", st&.exitstatus&.zero?,
+        "exit #{st.exitstatus.inspect}\nstdout: #{out}\nstderr: #{err}")
+  return if st&.exitstatus&.zero?
+
+  puts "boot_smoke: the install gate failed — the exec probes need the installed pair"
+  exit 143
+end
+
+# The shim dispatch rides R's engine shape: the banner and the "> " echo
+# surround the probe output, and on the tebako-runtime-r#5 class the
+# echo of the -e SOURCE itself carries the marker text — so a probe
+# matches only a WHOLE output line, never a substring.
+def expect_output_line(name, out, err, status, line)
+  lines = out.delete("\r").lines.map(&:strip)
+  check(name, status&.exitstatus&.zero? && lines.include?(line),
+        "expected exit 0 + an output line #{line.inspect}\nstdout: #{out}\nstderr: #{err}")
+end
+
+def run_published_pair(options)
+  tebako = resolve_tebako_cli(options[:tebako])
+  registry = options[:registry]
+  puts "-- Published-pair acceptance: #{tebako} installing from #{registry}"
+  body = ->(home) { published_pair_checks(tebako, registry, home) }
+  if options[:home]
+    body.call(File.expand_path(options[:home]))
+  else
+    Dir.mktmpdir("tebako-r-published-pair", &body)
+  end
+end
+
+def published_pair_checks(tebako, registry, home)
+  cli_gate("add-registry #{registry}", tebako, home, ["add-registry", registry])
+  cli_gate("install r (the registry default)", tebako, home, ["install", "r"])
+
+  shim = File.join(home, "shims", "r")
+  check("published-pair: the shim materialized", File.file?(shim), "no #{shim} after a green install")
+  unless File.file?(shim)
+    puts "boot_smoke: no shim to run the exec probes against"
+    exit 143
+  end
+
+  env = cli_env(home)
+  # --version is the shim-dispatch proof ONLY — the fast path never
+  # touches R, so it answers even on the #5 class. The exec probes are
+  # the acceptance.
+  out, err, st = Open3.capture3(env, shim, "--version")
+  expect_ok("published-pair: --version answers through the shim", out, err, st, "Rscript (R) version")
+  # The census probe: the installed pair EXECUTES -e — the mounted env
+  # image serves R's base package through the interpreter's own IO.
+  out, err, st = Open3.capture3(env, shim, "-e", 'cat("ok\n")')
+  expect_output_line("published-pair: the installed pair executes -e (the census probe)", out, err, st, "ok")
+  # The LAPACK solve: the dlopen'd lapack module binds off the installed
+  # pair end to end (the boot scenario's binding probe, installed shape).
+  out, err, st = Open3.capture3(env, shim, "-e", 'cat(sum(solve(matrix(c(2, 0, 0, 4), 2, 2))), "\n")')
+  expect_output_line("published-pair: LAPACK computes through the shim", out, err, st, "0.75")
+end
+
 KNOWN_SCENARIOS = %w[bare boot payload compute-floor bad-mount mount-root-override
                      mount-root-malformed override-ungranted].freeze
 # Scenarios that build images with the tfs CLI.
 TFS_SCENARIOS = %w[payload override-ungranted].freeze
+# The installed-pair scenario (the header block): explicit opt-in ONLY.
+# "all" stays the build-tree set — on PR CI it runs against the freshly
+# built pair, and installing whatever the registry default names (the
+# PREVIOUS release) would gate the PR on stale bytes.
+INSTALL_SCENARIOS = %w[published-pair].freeze
 
 def selected_scenarios(only)
   return KNOWN_SCENARIOS.dup if only == "all"
-  return [only] if KNOWN_SCENARIOS.include?(only)
+  return [only] if (KNOWN_SCENARIOS + INSTALL_SCENARIOS).include?(only)
 
-  usage_error("unknown scenario '#{only}' (known: #{KNOWN_SCENARIOS.join(", ")})")
+  usage_error("unknown scenario '#{only}' (known: #{(KNOWN_SCENARIOS + INSTALL_SCENARIOS + ["all"]).join(", ")})")
 end
 
 def run_scenarios(executable, platform, selected, tfs:)
@@ -508,11 +637,15 @@ def run_scenarios(executable, platform, selected, tfs:)
   end
 end
 
-executable = resolve_executable(options[:runtime_root], options[:exe])
-puts "-- Boot smoke: #{executable} (#{platform.host_id})"
 selected = selected_scenarios(options[:scenario])
-tfs = (selected & TFS_SCENARIOS).any? ? resolve_tfs(options[:tfs]) : nil
-run_scenarios(executable, platform, selected, tfs: tfs)
+if selected == INSTALL_SCENARIOS
+  run_published_pair(options)
+else
+  executable = resolve_executable(options[:runtime_root], options[:exe])
+  puts "-- Boot smoke: #{executable} (#{platform.host_id})"
+  tfs = (selected & TFS_SCENARIOS).any? ? resolve_tfs(options[:tfs]) : nil
+  run_scenarios(executable, platform, selected, tfs: tfs)
+end
 
 if $failures.positive?
   puts "#{$failures} scenario check(s) failed"

@@ -5,14 +5,15 @@ runtimes** — the spec-17 driver linked into the R interpreter — from
 pristine CRAN release tarballs, in the pinned tpkg-builder containers,
 for every platform the matrix declares.
 
-**Status: pre-release, full POSIX census.** Five legs (linux-gnu
+**Status: v0.1.0 published, full POSIX census.** Five legs (linux-gnu
 x86_64, linux-musl x86_64/aarch64, macOS x86_64/arm64), one R line
-(4.6.x, catalog `4.6.2`), the publish/sign/registry pipeline wired
-(publish.yml + the tebako-release machinery). No release has been cut —
-the first release is the owner's explicit act, and everything lands
-through draft PRs (the ecosystem's hard rule: nothing touches `main`,
-tags, or releases without the owner's explicit go-ahead). The
-follow-ups section names the next increments.
+(4.6.x, catalog `4.6.2`), the publish/sign/registry pipeline wired and
+exercised (publish.yml + the tebako-release machinery), plus the
+per-platform installed-pair acceptance (`tools/boot_smoke --scenario
+published-pair`) closing publish runs. Everything lands through draft
+PRs (the ecosystem's hard rule: nothing touches `main`, tags, or
+releases without the owner's explicit go-ahead). The follow-ups section
+names the next increments.
 
 ## The wedge: CI / headless Rscript
 
@@ -196,7 +197,10 @@ tools/build_runtime --r 4.6.2
   5. package + sidecars (above)
 ci/check_symbol_provenance.sh   the linked-driver + closure gates
 tools/boot_smoke                bare/boot/payload/compute-floor/
-                                bad-mount/mount-root scenarios
+                                bad-mount/mount-root scenarios, plus
+                                the opt-in published-pair acceptance
+                                (install + execute the registry
+                                default's bytes)
 ```
 
 ## Matrix grammar
@@ -217,7 +221,9 @@ under the dispatch filters (`R_FILTER`, `PLATFORM_FILTER`,
 publish → verify. `publish.yml` is the release coordinator (per-leg
 publish + sign from `_build-platform.yml`, then the one release job:
 the whole-matrix audit, the registry render, the bot PR, the aggregate
-nudge).
+nudge — and, on publish runs, the per-platform acceptance jobs that
+install + execute the freshly published pair through the registry,
+the installed-flow gate tebako-runtime-r#5 proved necessary).
 
 ## The publish pipeline
 
@@ -231,7 +237,13 @@ uploads its write-once names (payload + `.sha256` sidecars +
 `TEBAKO_RELEASE_SIGNING_KEY`); the macOS legs sign + notarize the exe
 in-leg first (spec 31, `ci/macos-sign-notarize-runtime.sh`, gated on
 `APPLE_SIGNING_ENABLED` — sign-then-hash: every downstream gate and the
-`.sha256` anchor the exact signed bytes). `tools/registry_update.rb`
+`.sha256` anchor the exact signed bytes). The entitlements profile's
+`allow-dyld-environment-variables` grant is load-bearing there: the
+hardened runtime strips `DYLD_INSERT_LIBRARIES` without it, and the
+preload shim's re-exec is the interpreter's only VFS visibility —
+because the macos-15 runners tolerate its absence, the sign script
+asserts the embedded profile statically (tebako-runtime-r#5;
+docs/build-chain.md carries the rationale). `tools/registry_update.rb`
 renders the registry mirror from the release's shards (spec 04 §2) and
 the coordinator lands it on main by bot PR + auto-merge.
 
@@ -297,6 +309,3 @@ contract.yml / versions.yml       the pins (SSOT)
   closure-audited the same way.
 - **The boot-contract parity spec/** (rspec), and a hello-runtimes arm
   once payloads exist.
-- **The first release**: an operator act — bump `VERSION`, dispatch
-  `publish.yml` (r_filter=full, platform=all, publish=true), and the
-  pipeline builds, signs, audits, and renders the registry.

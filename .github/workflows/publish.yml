@@ -53,6 +53,24 @@
 # on a free namespace — the per-asset delete→re-upload wedge never gets
 # triggered.
 #
+# The acceptance jobs close a publish run (tebako-runtime-r#5's
+# coverage): per platform that published green, install the pair the
+# freshly landed registry default names — through the contract-pinned
+# tebako CLI, into a scratch TEBAKO_HOME — and execute it
+# (tools/boot_smoke --scenario published-pair: --version through the
+# shim, the census -e probe, the LAPACK solve). The build-tree smoke
+# cannot see the installed flow: what it boots is the freshly built pair
+# off TEBAKO_RUNTIME_IMAGE; what a user runs is the registry default's
+# bytes, fetched + mounted by the loader and dispatched by the shim — #5
+# (a published macos-arm64 pair that answered --version and died on -e)
+# shipped green in the former and died in the latter. The macos-arm64
+# acceptance leg pins macos-14 ON PURPOSE: macOS 15's dyld tolerates a
+# missing allow-dyld-environment-variables grant (the blind spot that
+# shipped #5), while macOS 14 strips DYLD_INSERT_LIBRARIES without it —
+# the entitlement class's exec canary (the arch-independent backstop is
+# ci/macos-sign-notarize-runtime.sh's static embedded-profile
+# assertion).
+#
 # Deliberate deviations from the ruby coordinator (the python factory's,
 # inherited via php's):
 #   - publish defaults to FALSE (ruby: true): publishing is an explicit
@@ -440,3 +458,313 @@ jobs:
         run: gh api repos/tamatebako/versions/dispatches -f event_type=runtime-published
         env:
           GH_TOKEN: ${{ secrets.TEBAKO_CI_PAT_TOKEN || secrets.GITHUB_TOKEN }}
+
+  # The installed-pair acceptance (tebako-runtime-r#5's coverage — the
+  # header note). One job per platform, gated on THAT platform's green
+  # publish: a platform that was not selected or did not build green has
+  # nothing to accept, and a red sibling never masks a green platform's
+  # verdict.
+  acceptance-linux-gnu:
+    name: Acceptance — the installed pair (linux-gnu)
+    needs: [release, linux-gnu]
+    if: ${{ always() && !cancelled() && inputs.publish && !inputs.audit && !inputs.registry_only && needs.linux-gnu.result == 'success' && needs.linux-gnu.outputs.run == 'true' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: '3.3'
+          bundler-cache: false
+
+      # The acceptance installs what the registry default names — only
+      # truthful once the publish's registry row is on main (main is
+      # protected; the row lands by bot PR + auto-merge). A timeout is a
+      # NAMED failure: installing anyway would test the PREVIOUS
+      # release's bytes and report their verdict as this publish's.
+      - name: Wait for the registry row on main
+        env:
+          GH_TOKEN: ${{ secrets.TEBAKO_CI_PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          tag="v$(cat VERSION)"
+          branch="publish/v${tag}-registry"
+          landed=""
+          for _ in $(seq 1 60); do
+            merged=$(gh pr list --head "$branch" --state merged --json number --jq '.[0].number // empty' 2>/dev/null || true)
+            if [ -n "$merged" ]; then
+              landed="registry PR #${merged} merged"
+              break
+            fi
+            # Idempotent republication: an unchanged render opens no PR
+            # — the rows are already on main.
+            if gh api "repos/${{ github.repository }}/contents/tpkg-registry.yaml?ref=main" --jq .content 2>/dev/null \
+                 | base64 -d | grep -qE ":${tag}[[:space:]]*$"; then
+              landed="the registry on main already names ${tag} (no merged PR — an unchanged render)"
+              break
+            fi
+            sleep 10
+          done
+          if [ -z "$landed" ]; then
+            echo "::error::${branch} is not merged and main's registry does not name ${tag} within 10 minutes — installing now would test the PREVIOUS release's bytes"
+            exit 1
+          fi
+          echo "$landed"
+
+      # The contract-pinned tebako product line's CLI drives the install
+      # — the same link_unit_release pin the legs' link unit + tfs CLI
+      # ride (one product release, one line, proven together).
+      # tebako-shim rides beside it: `install` links shims/<name> onto a
+      # tebako-shim, and the pair's layout mirrors an installed prefix.
+      - name: Fetch + verify the pinned tebako CLI pair
+        env:
+          PID: linux-gnu-x86_64
+        run: |
+          set -euo pipefail
+          case "$(uname -s)" in
+            Darwin) shac="shasum -a 256" ;;
+            *)      shac="sha256sum" ;;
+          esac
+          pin=$(ruby -ryaml -e 'puts YAML.load_file("contract.yml")["link_unit_release"]')
+          ver="${pin#v}"
+          base="https://github.com/tamatebako/tebako/releases/download/${pin}"
+          mkdir -p .build/acceptance-cli
+          for tool in tebako tebako-shim; do
+            asset="${tool}-${ver}-${PID}"
+            curl -fsSL --retry 3 -o ".build/acceptance-cli/${asset}" "${base}/${asset}"
+            curl -fsSL --retry 3 -o ".build/acceptance-cli/${asset}.sha256" "${base}/${asset}.sha256"
+          done
+          ( cd .build/acceptance-cli
+            $shac -c "tebako-${ver}-${PID}.sha256"
+            $shac -c "tebako-shim-${ver}-${PID}.sha256"
+            mv "tebako-${ver}-${PID}" tebako
+            mv "tebako-shim-${ver}-${PID}" tebako-shim
+            chmod +x tebako tebako-shim )
+          echo "tebako CLI ${pin} (${PID}) fetched + sha256-verified"
+
+      # The leg executes inside the SAME digest-pinned tpkg-builder
+      # image the build leg ran in: the ref flows from matrix.json, the
+      # tag + digest from contract.yml — never a hand-copied coordinate
+      # (the host assert turns the matrix drift class into a named
+      # error).
+      - name: Install the published pair + execute it
+        env:
+          LEG_OS: linux-gnu
+          LEG_ARCH: x86_64
+          LEG_HOST: ubuntu-22.04
+        run: |
+          set -euo pipefail
+          image=$(ruby -ryaml -rjson -e '
+            os, arch, host = ENV.fetch("LEG_OS"), ENV.fetch("LEG_ARCH"), ENV.fetch("LEG_HOST")
+            row = JSON.parse(File.read(".github/matrix.json"))["env"].find { |e| e["os"] == os && e["arch"] == arch }
+            abort("matrix.json names no #{os}/#{arch} leg") if row.nil? || row["container"].nil?
+            abort("matrix.json host drift: #{row["host"]} vs #{host}") unless row["host"] == host
+            carch = { "x86_64" => "amd64", "arm64" => "arm64" }.fetch(arch)
+            contract = YAML.load_file("contract.yml")
+            digest = contract.dig("container_digests", File.basename(row["container"]), carch)
+            abort("contract.yml records no digest for #{row["container"]}/#{carch}") if digest.nil?
+            puts "#{row["container"]}:#{contract["container_version"]}@#{digest}"
+          ')
+          echo "acceptance in $image"
+          docker run --rm -v "${{ github.workspace }}:/mnt/w" -w /mnt/w "$image" bash -c '
+            set -e
+            export PATH="/mnt/w/.build/acceptance-cli:$PATH"
+            tools/boot_smoke --scenario published-pair --tebako /mnt/w/.build/acceptance-cli/tebako
+          '
+
+  acceptance-linux-musl:
+    name: Acceptance — the installed pair (linux-musl)
+    needs: [release, linux-musl]
+    if: ${{ always() && !cancelled() && inputs.publish && !inputs.audit && !inputs.registry_only && needs.linux-musl.result == 'success' && needs.linux-musl.outputs.run == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, host: ubuntu-22.04 }
+          - { arch: arm64,  host: ubuntu-22.04-arm }
+    runs-on: ${{ matrix.host }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: '3.3'
+          bundler-cache: false
+
+      # Same wait as the gnu job: the registry row must be on main
+      # before the install, or the acceptance tests the PREVIOUS
+      # release's bytes.
+      - name: Wait for the registry row on main
+        env:
+          GH_TOKEN: ${{ secrets.TEBAKO_CI_PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          tag="v$(cat VERSION)"
+          branch="publish/v${tag}-registry"
+          landed=""
+          for _ in $(seq 1 60); do
+            merged=$(gh pr list --head "$branch" --state merged --json number --jq '.[0].number // empty' 2>/dev/null || true)
+            if [ -n "$merged" ]; then
+              landed="registry PR #${merged} merged"
+              break
+            fi
+            if gh api "repos/${{ github.repository }}/contents/tpkg-registry.yaml?ref=main" --jq .content 2>/dev/null \
+                 | base64 -d | grep -qE ":${tag}[[:space:]]*$"; then
+              landed="the registry on main already names ${tag} (no merged PR — an unchanged render)"
+              break
+            fi
+            sleep 10
+          done
+          if [ -z "$landed" ]; then
+            echo "::error::${branch} is not merged and main's registry does not name ${tag} within 10 minutes — installing now would test the PREVIOUS release's bytes"
+            exit 1
+          fi
+          echo "$landed"
+
+      - name: Fetch + verify the pinned tebako CLI pair
+        env:
+          PID: linux-musl-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          case "$(uname -s)" in
+            Darwin) shac="shasum -a 256" ;;
+            *)      shac="sha256sum" ;;
+          esac
+          pin=$(ruby -ryaml -e 'puts YAML.load_file("contract.yml")["link_unit_release"]')
+          ver="${pin#v}"
+          base="https://github.com/tamatebako/tebako/releases/download/${pin}"
+          mkdir -p .build/acceptance-cli
+          for tool in tebako tebako-shim; do
+            asset="${tool}-${ver}-${PID}"
+            curl -fsSL --retry 3 -o ".build/acceptance-cli/${asset}" "${base}/${asset}"
+            curl -fsSL --retry 3 -o ".build/acceptance-cli/${asset}.sha256" "${base}/${asset}.sha256"
+          done
+          ( cd .build/acceptance-cli
+            $shac -c "tebako-${ver}-${PID}.sha256"
+            $shac -c "tebako-shim-${ver}-${PID}.sha256"
+            mv "tebako-${ver}-${PID}" tebako
+            mv "tebako-shim-${ver}-${PID}" tebako-shim
+            chmod +x tebako tebako-shim )
+          echo "tebako CLI ${pin} (${PID}) fetched + sha256-verified"
+
+      - name: Install the published pair + execute it
+        env:
+          LEG_OS: linux-musl
+          LEG_ARCH: ${{ matrix.arch }}
+          LEG_HOST: ${{ matrix.host }}
+        run: |
+          set -euo pipefail
+          image=$(ruby -ryaml -rjson -e '
+            os, arch, host = ENV.fetch("LEG_OS"), ENV.fetch("LEG_ARCH"), ENV.fetch("LEG_HOST")
+            row = JSON.parse(File.read(".github/matrix.json"))["env"].find { |e| e["os"] == os && e["arch"] == arch }
+            abort("matrix.json names no #{os}/#{arch} leg") if row.nil? || row["container"].nil?
+            abort("matrix.json host drift: #{row["host"]} vs #{host}") unless row["host"] == host
+            carch = { "x86_64" => "amd64", "arm64" => "arm64" }.fetch(arch)
+            contract = YAML.load_file("contract.yml")
+            digest = contract.dig("container_digests", File.basename(row["container"]), carch)
+            abort("contract.yml records no digest for #{row["container"]}/#{carch}") if digest.nil?
+            puts "#{row["container"]}:#{contract["container_version"]}@#{digest}"
+          ')
+          echo "acceptance in $image"
+          docker run --rm -v "${{ github.workspace }}:/mnt/w" -w /mnt/w "$image" bash -c '
+            set -e
+            export PATH="/mnt/w/.build/acceptance-cli:$PATH"
+            tools/boot_smoke --scenario published-pair --tebako /mnt/w/.build/acceptance-cli/tebako
+          '
+
+  acceptance-macos:
+    name: Acceptance — the installed pair (macos)
+    needs: [release, macos]
+    if: ${{ always() && !cancelled() && inputs.publish && !inputs.audit && !inputs.registry_only && needs.macos.result == 'success' && needs.macos.outputs.run == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-14 ON PURPOSE (the header note): macOS 15's dyld
+          # tolerates a missing allow-dyld-environment-variables grant —
+          # the blind spot that shipped #5 green — while macOS 14 strips
+          # DYLD_INSERT_LIBRARIES without it. This leg is the
+          # entitlement class's exec canary.
+          - { arch: arm64,  host: macos-14 }
+          # The only Intel runner at or above the exe's 14.0 floor
+          # (contract.yml's macos_deployment_target); the entitlement
+          # class rides the arm64 canary + the sign script's static
+          # assertion, both arch-independent.
+          - { arch: x86_64, host: macos-15-intel }
+    runs-on: ${{ matrix.host }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1.321.0
+        with:
+          ruby-version: '3.3'
+          bundler-cache: false
+
+      # Same wait as the gnu job: the registry row must be on main
+      # before the install, or the acceptance tests the PREVIOUS
+      # release's bytes.
+      - name: Wait for the registry row on main
+        env:
+          GH_TOKEN: ${{ secrets.TEBAKO_CI_PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          tag="v$(cat VERSION)"
+          branch="publish/v${tag}-registry"
+          landed=""
+          for _ in $(seq 1 60); do
+            merged=$(gh pr list --head "$branch" --state merged --json number --jq '.[0].number // empty' 2>/dev/null || true)
+            if [ -n "$merged" ]; then
+              landed="registry PR #${merged} merged"
+              break
+            fi
+            if gh api "repos/${{ github.repository }}/contents/tpkg-registry.yaml?ref=main" --jq .content 2>/dev/null \
+                 | base64 -d | grep -qE ":${tag}[[:space:]]*$"; then
+              landed="the registry on main already names ${tag} (no merged PR — an unchanged render)"
+              break
+            fi
+            sleep 10
+          done
+          if [ -z "$landed" ]; then
+            echo "::error::${branch} is not merged and main's registry does not name ${tag} within 10 minutes — installing now would test the PREVIOUS release's bytes"
+            exit 1
+          fi
+          echo "$landed"
+
+      - name: Fetch + verify the pinned tebako CLI pair
+        env:
+          PID: macos-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          case "$(uname -s)" in
+            Darwin) shac="shasum -a 256" ;;
+            *)      shac="sha256sum" ;;
+          esac
+          pin=$(ruby -ryaml -e 'puts YAML.load_file("contract.yml")["link_unit_release"]')
+          ver="${pin#v}"
+          base="https://github.com/tamatebako/tebako/releases/download/${pin}"
+          mkdir -p .build/acceptance-cli
+          for tool in tebako tebako-shim; do
+            asset="${tool}-${ver}-${PID}"
+            curl -fsSL --retry 3 -o ".build/acceptance-cli/${asset}" "${base}/${asset}"
+            curl -fsSL --retry 3 -o ".build/acceptance-cli/${asset}.sha256" "${base}/${asset}.sha256"
+          done
+          ( cd .build/acceptance-cli
+            $shac -c "tebako-${ver}-${PID}.sha256"
+            $shac -c "tebako-shim-${ver}-${PID}.sha256"
+            mv "tebako-${ver}-${PID}" tebako
+            mv "tebako-shim-${ver}-${PID}" tebako-shim
+            chmod +x tebako tebako-shim )
+          echo "tebako CLI ${pin} (${PID}) fetched + sha256-verified"
+
+      # Runner-native (the macOS build legs' shape — no container).
+      - name: Install the published pair + execute it
+        run: |
+          set -euo pipefail
+          export PATH="$PWD/.build/acceptance-cli:$PATH"
+          tools/boot_smoke --scenario published-pair --tebako "$PWD/.build/acceptance-cli/tebako"

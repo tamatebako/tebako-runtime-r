@@ -26,12 +26,12 @@
 
 # ci/macos-sign-notarize-runtime.sh — spec 31 §5/§8.4: sign the freshly
 # built macOS runtime exe (Developer ID Application, hardened runtime,
-# the ci/runtime.entitlements pair) and notarize it, in-leg, BEFORE the
+# the ci/runtime.entitlements profile) and notarize it, in-leg, BEFORE the
 # symbol-provenance check and the boot smoke — every downstream gate, and
 # the publish stage's .sha256 sidecar, then anchors the exact SIGNED
 # bytes (sign-then-hash is mandatory).
 # (tebako-runtime-php's script, R edition — the machinery is
-# exe-shape-agnostic; the entitlements pair's R rationale is in
+# exe-shape-agnostic; the entitlements profile's R rationale is in
 # ci/runtime.entitlements.)
 #
 # The spec 31 §5 gate: the repo variable APPLE_SIGNING_ENABLED=true
@@ -91,18 +91,32 @@ HASH=$(security find-identity -v -p codesigning "$KC" | awk '/Developer ID Appli
 [ -n "$HASH" ] || { echo "::error::no Developer ID Application identity in the p12"; exit 1; }
 echo "signing identity cert: ${HASH:0:10}…"
 
-step "codesign (hardened runtime + the spec 31 §3 pair)"
+step "codesign (hardened runtime + the spec 31 §3 profile)"
 codesign --force --options runtime --timestamp --keychain "$KC" \
   --entitlements ci/runtime.entitlements --sign "$HASH" "$exe"
 codesign --verify --strict --verbose=1 "$exe"
 codesign -dvv "$exe" 2>&1 | grep -q "TeamIdentifier=$APPLE_TEAM_ID" \
   || { echo "::error::TeamIdentifier is not $APPLE_TEAM_ID — signed by an unexpected identity"; exit 1; }
-# macOS 15 emits the embedded plist single-line — count <true/> values,
-# never key lines.
+# macOS 15 emits the embedded plist single-line — count <true/> values
+# AND grep each key by name (a count alone passes a wrong-keyed
+# profile). The name check is the load-bearing half: no CI runner can
+# police a MISSING allow-dyld-environment-variables at exec time (the
+# macos-15 runners' dyld tolerates the omission and serves the shim
+# anyway; macOS 14 strips DYLD_INSERT_LIBRARIES without it and the
+# installed runtime dies shimless — tebako-runtime-r#5 shipped green
+# exactly that way), so the profile is asserted statically here, where
+# the bytes are still in-leg.
 codesign -d --entitlements :- "$exe" > "$work/embedded.xml" 2>/dev/null || true
 TRUES=$(grep -o '<true/>' "$work/embedded.xml" | wc -l | tr -d ' ')
-[ "$TRUES" = "2" ] || { cat "$work/embedded.xml"; echo "::error::entitlement pair not embedded (got $TRUES <true/>)"; exit 1; }
-echo "entitlements embedded: disable-library-validation + allow-jit"
+[ "$TRUES" = "3" ] || { cat "$work/embedded.xml"; echo "::error::entitlement profile not embedded (got $TRUES <true/>)"; exit 1; }
+for key in allow-dyld-environment-variables disable-library-validation allow-jit; do
+  grep -q "com.apple.security.cs.$key" "$work/embedded.xml" || {
+    cat "$work/embedded.xml"
+    echo "::error::entitlement $key missing from the embedded profile — tebako-runtime-r#5's class: the runner cannot be trusted to catch it at exec time"
+    exit 1
+  }
+done
+echo "entitlements embedded: allow-dyld-environment-variables + disable-library-validation + allow-jit"
 
 step "notarize (App Store Connect API key)"
 printf '%s' "$APPLE_ASC_KEY_P8" > "$work/AuthKey.p8"
