@@ -75,7 +75,14 @@ release (read-only — the legs' publish jobs already landed their
 packages), renders the registry from the release's shards
 (`tools/registry_update.rb`), and lands it on main by bot PR +
 auto-merge (main is protected), then nudges the official aggregate and
-pings the versions catalog.
+pings the versions catalog. On publish runs, three acceptance jobs close
+the pipeline (tebako-runtime-r#5's coverage): once the registry row is
+on main, each green platform installs the pair the registry default
+names — through the contract-pinned tebako CLI, into a scratch
+TEBAKO_HOME, the linux legs inside the same digest-pinned tpkg-builder
+image — and executes it (`tools/boot_smoke --scenario published-pair`).
+The build-tree smoke cannot see that installed flow; #5 shipped green
+exactly there.
 
 `lint.yml` is the static gate (no builds): the same contract check, the
 catalog/matrix resolution, a `ruby -c` sweep over every authored ruby
@@ -151,10 +158,23 @@ macOS legs are runner-native. Each leg's provisioning:
   (tebako-runtime-python#81), and the provenance gate's Mach-O arm
   asserts recorded == pin. The sign+notarize arm
   (`ci/macos-sign-notarize-runtime.sh`, spec 31: Developer ID
-  Application + hardened runtime + notary ticket, entitlements
-  disable-library-validation + allow-jit) runs in-leg after the build,
-  gated on `APPLE_SIGNING_ENABLED` — every downstream gate and the
-  publish stage's .sha256 anchor the exact SIGNED bytes.
+  Application + hardened runtime + notary ticket) runs in-leg after the
+  build, gated on `APPLE_SIGNING_ENABLED` — every downstream gate and
+  the publish stage's .sha256 anchor the exact SIGNED bytes. The
+  entitlements profile (`ci/runtime.entitlements`) carries
+  **allow-dyld-environment-variables** — the load-bearing grant: the
+  spec 22 tier-1 boot re-execs the exe with the driver-armed
+  `DYLD_INSERT_LIBRARIES`, and the hardened runtime strips every
+  `DYLD_*` variable at launch without it (the re-exec then runs
+  shimless, the mount root never materializes, and R dies "unable to
+  open the base package" while `--version` keeps answering —
+  tebako-runtime-r#5) — plus disable-library-validation (the in-image
+  native objects are unsigned) and allow-jit (inert; future-proofing).
+  Because the macos-15 runners' dyld TOLERATES a missing dyld-env
+  grant, no runner can police that class at exec time: the script
+  asserts the embedded profile statically, by key name, and
+  `publish.yml`'s macos acceptance leg pins **macos-14** as the exec
+  canary (its dyld strips the variables without the grant).
 
 No **libssl-dev** and no **zlib1g-dev** reliance on the linux legs,
 deliberately: the deps stage builds its own static OpenSSL 3 (the
@@ -490,5 +510,6 @@ with different incidental libraries produce the SAME artifact.
 - The front-end (the Rscript translation + the interpreter-shaped
   passthrough), the R_HOME story, the re-exec:
   `build/resources/tebako_r_main.c` (its header comment is normative).
-- The boot-contract scenarios: `tools/boot_smoke`.
+- The boot-contract scenarios, plus the installed-pair acceptance
+  (`published-pair`): `tools/boot_smoke`.
 - This architecture: `docs/build-chain.md`.

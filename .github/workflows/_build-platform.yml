@@ -468,7 +468,7 @@ jobs:
         run: tools/build_runtime --r "${{ matrix.r }}"
 
       # Spec 31 §5/§8.4: sign (Developer ID Application, hardened
-      # runtime, the ci/runtime.entitlements pair) + notarize the macOS
+      # runtime, the ci/runtime.entitlements profile) + notarize the macOS
       # runtime exe IN-LEG, before the symbol-provenance check and the
       # boot smoke — every downstream gate, and the publish stage's
       # .sha256 sidecar, anchors the exact SIGNED bytes (sign-then-hash

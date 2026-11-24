@@ -22,7 +22,7 @@ workspace root) — read it first. The short version as applied here:
 - **YAML** for all authored config/manifests; named errors and named
   exit codes, never silent fallbacks.
 
-## Repo status: pre-release, full POSIX census
+## Repo status: v0.1.0 published, full POSIX census
 
 `tools/build_runtime` is implemented (the tebako-runtime-php
 `build/lib` port, R edition): fetch/verify → configure/make → driver
@@ -33,10 +33,12 @@ packaging → sidecars, gated by `ci/check_symbol_provenance.sh` and
 thin triggers over `_build-platform.yml`: parity → compute → preflight
 → build → publish → verify) plus the static gate (`lint.yml`). The
 publish pipeline (`publish.yml` + the tebako-release gem via
-`scripts/release_adapter.rb` + `tools/registry_update.rb`) is present,
-but **no release has been cut** — the first release is the owner's
-explicit act (README's follow-ups section names the remaining
-increments).
+`scripts/release_adapter.rb` + `tools/registry_update.rb`) is wired and
+exercised — **v0.1.0 is published**, and publish runs close with the
+per-platform installed-pair acceptance (`tools/boot_smoke --scenario
+published-pair`, tebako-runtime-r#5's coverage). Merges, tags, and
+releases remain the owner's explicit act (README's follow-ups section
+names the remaining increments).
 
 ## Repo-local gotchas
 
