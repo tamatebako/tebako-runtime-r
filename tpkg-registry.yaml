@@ -41,6 +41,25 @@ payloads:
         sha256: 207063649165dccf98de7ab960686c92c9193e9d295b13f392d9f0d788eb82f7
     release:
       ref: tfs:github:tamatebako/tebako-runtime-r:v0.1.0
+  - version: 4.6.2-0.1.1
+    platforms:
+      aarch64-linux-musl:
+        artifact: tebako-runtime-0.1.1-r-4.6.2-linux-musl-arm64.tfs
+        sha256: bc7a8e7103bdd9ed23aa6fcab0cb85311a9b8a6bfa829c099e2ffd6a4e6d665f
+      aarch64-macos:
+        artifact: tebako-runtime-0.1.1-r-4.6.2-macos-arm64.tfs
+        sha256: a8e9945c91b8109dfadabd9d727dd89e1975338115dccf42d1dba46cb47d3eba
+      x86_64-linux-gnu:
+        artifact: tebako-runtime-0.1.1-r-4.6.2-linux-gnu-x86_64.tfs
+        sha256: 938c985e7c44ec12384a2726d40c3bdce8ad41edf01b224d6cce0556b7e3a078
+      x86_64-linux-musl:
+        artifact: tebako-runtime-0.1.1-r-4.6.2-linux-musl-x86_64.tfs
+        sha256: 8685118ee139174e136fe823ad6633f9be5600146f1ec2f00688b589c398a201
+      x86_64-macos:
+        artifact: tebako-runtime-0.1.1-r-4.6.2-macos-x86_64.tfs
+        sha256: e0e22a9ab4c64bbbd94a672ea13bb6d93a747e16f3f20e9092c9de92c7c0ccd6
+    release:
+      ref: tfs:github:tamatebako/tebako-runtime-r:v0.1.1
   engine: r
   implementation: r
-  default: 4.6.2-0.1.0
+  default: 4.6.2-0.1.1
