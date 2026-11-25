@@ -172,9 +172,12 @@ macOS legs are runner-native. Each leg's provisioning:
   native objects are unsigned) and allow-jit (inert; future-proofing).
   Because the macos-15 runners' dyld TOLERATES a missing dyld-env
   grant, no runner can police that class at exec time: the script
-  asserts the embedded profile statically, by key name, and
-  `publish.yml`'s macos acceptance leg pins **macos-14** as the exec
-  canary (its dyld strips the variables without the grant).
+  asserts the embedded profile statically, by key name.
+  `publish.yml`'s macos acceptance leg pinned **macos-14** as the
+  stripping-platform exec canary (its dyld strips the variables
+  without the grant) until GitHub retired the image 2026-11-02; the
+  leg now rides macos-15 — gating the installed pair's boot on the
+  current OS — and the static assertion carries the class alone.
 
 No **libssl-dev** and no **zlib1g-dev** reliance on the linux legs,
 deliberately: the deps stage builds its own static OpenSSL 3 (the
